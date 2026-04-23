@@ -5,9 +5,14 @@
 
 // ウィンドウ定数
 #define APP_TITLE           L"VizCommand"
-#define CMDBAR_HEIGHT       36      // コマンド入力バーの高さ
-#define ITEM_MARGIN         6       // 各出力アイテム間の余白
+#define CMDBAR_HEIGHT       26      // プロンプト行の高さ (Consolas 18pt 1行分)
+#define ITEM_MARGIN         4       // 各出力アイテム間の余白
 #define CMD_EDIT_ID         100
+
+// コンソール配色 (CMD風黒背景)
+#define CON_BG      RGB(0,   0,   0  )  // 背景
+#define CON_FG      RGB(192, 192, 192)  // テキスト
+#define CON_GREEN   RGB(0,   204, 0  )  // プロンプト ">"
 
 // 出力アイテムの種類
 enum class OutputType {
