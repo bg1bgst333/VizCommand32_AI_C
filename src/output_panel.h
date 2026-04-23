@@ -16,3 +16,5 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath);
 // ユーティリティ
 void OutputPanel_Clear         (HWND hPanel);
 void OutputPanel_ScrollToBottom(HWND hPanel);
+void OutputPanel_AddPrompt     (HWND hPanel);
+void OutputPanel_FocusPrompt   (HWND hPanel);
