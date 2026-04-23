@@ -1,4 +1,5 @@
 #include "output_panel.h"
+#include "command.h"
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -83,6 +84,186 @@ static void RegisterImageCtrl(HINSTANCE hInst)
     wc.hInstance     = hInst;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = IMAGE_CTRL_CLASS;
+    RegisterClassEx(&wc);
+}
+
+// ================================================================
+// PromptCtrl  コマンド入力行 ("> [EDIT]" をインラインに表示)
+// ================================================================
+#define PROMPT_CTRL_CLASS L"VizCmdPromptCtrl"
+
+struct PromptCtrlData {
+    HWND  hLabel    = nullptr;
+    HWND  hEdit     = nullptr;
+    HFONT hFont     = nullptr;
+    bool  executed  = false;
+};
+
+// コマンド履歴 (全プロンプトで共有)
+static std::vector<std::wstring> g_cmdHistory;
+static int g_historyIdx = 0;
+
+// EDIT サブクラス: ENTER / ↑↓ キー処理
+static LRESULT CALLBACK PromptEditSubclassProc(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR uIdSubclass, DWORD_PTR)
+{
+    switch (msg) {
+    case WM_KEYDOWN:
+        switch (wParam) {
+        case VK_RETURN: {
+            HWND hPromptCtrl  = GetParent(hwnd);
+            HWND hOutputPanel = GetParent(hPromptCtrl);
+            auto* pd = (PromptCtrlData*)GetWindowLongPtr(hPromptCtrl, GWLP_USERDATA);
+            if (pd && !pd->executed) {
+                wchar_t buf[4096] = {};
+                GetWindowText(hwnd, buf, 4096);
+                std::wstring cmd(buf);
+
+                // EDIT を読み取り専用に固定
+                pd->executed = true;
+                LONG style = GetWindowLong(hwnd, GWL_STYLE);
+                SetWindowLong(hwnd, GWL_STYLE, style | ES_READONLY);
+                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+                // 履歴追加
+                if (!cmd.empty()) {
+                    if (g_cmdHistory.empty() || g_cmdHistory.back() != cmd)
+                        g_cmdHistory.push_back(cmd);
+                    g_historyIdx = (int)g_cmdHistory.size();
+                }
+
+                // コマンド実行 (AddPrompt + ScrollToBottom は command.cpp 側で行う)
+                ExecuteCommand(hOutputPanel, cmd);
+            }
+            return 0;
+        }
+        case VK_UP:
+            if (!g_cmdHistory.empty() && g_historyIdx > 0) {
+                --g_historyIdx;
+                SetWindowText(hwnd, g_cmdHistory[g_historyIdx].c_str());
+                int len = (int)g_cmdHistory[g_historyIdx].size();
+                SendMessage(hwnd, EM_SETSEL, len, len);
+            }
+            return 0;
+        case VK_DOWN:
+            if (!g_cmdHistory.empty()) {
+                ++g_historyIdx;
+                if (g_historyIdx >= (int)g_cmdHistory.size()) {
+                    g_historyIdx = (int)g_cmdHistory.size();
+                    SetWindowText(hwnd, L"");
+                } else {
+                    SetWindowText(hwnd, g_cmdHistory[g_historyIdx].c_str());
+                    int len = (int)g_cmdHistory[g_historyIdx].size();
+                    SendMessage(hwnd, EM_SETSEL, len, len);
+                }
+            }
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, PromptEditSubclassProc, uIdSubclass);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static HBRUSH g_hPromptBrush = nullptr; // 背景ブラシ (一度だけ作成)
+
+static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* d = (PromptCtrlData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs   = (CREATESTRUCT*)lParam;
+        auto* data = new PromptCtrlData{};
+        data->hFont = CreateFont(
+            18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+
+        data->hLabel = CreateWindow(
+            L"STATIC", L">",
+            WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+            0, 0, 26, CMDBAR_HEIGHT,
+            hwnd, nullptr, cs->hInstance, nullptr);
+        SendMessage(data->hLabel, WM_SETFONT, (WPARAM)data->hFont, FALSE);
+
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        int editW = std::max((int)rc.right - 26, 1);
+        data->hEdit = CreateWindowEx(
+            0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            26, 0, editW, CMDBAR_HEIGHT,
+            hwnd, nullptr, cs->hInstance, nullptr);
+        SendMessage(data->hEdit, WM_SETFONT, (WPARAM)data->hFont, FALSE);
+        SendMessage(data->hEdit, EM_SETCUEBANNER, 0,
+                    (LPARAM)L"コマンドを入力 (help で一覧)");
+        SetWindowSubclass(data->hEdit, PromptEditSubclassProc, 1, 0);
+
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        break;
+    }
+
+    case WM_SIZE:
+        if (d) {
+            int w = LOWORD(lParam);
+            MoveWindow(d->hLabel, 0,  0, 26,       CMDBAR_HEIGHT, TRUE);
+            MoveWindow(d->hEdit,  26, 0, w - 26,   CMDBAR_HEIGHT, TRUE);
+        }
+        break;
+
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
+        FillRect(hdc, &rc, g_hPromptBrush);
+        return 1;
+    }
+
+    case WM_CTLCOLOREDIT:
+        if (d && (HWND)lParam == d->hEdit) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, RGB(245, 245, 245));
+            SetTextColor(hdc, RGB(30, 30, 30));
+            if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
+            return (LRESULT)g_hPromptBrush;
+        }
+        break;
+
+    case WM_CTLCOLORSTATIC:
+        if (d && (HWND)lParam == d->hLabel) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, RGB(245, 245, 245));
+            SetTextColor(hdc, RGB(0, 128, 0));
+            if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
+            return (LRESULT)g_hPromptBrush;
+        }
+        break;
+
+    case WM_DESTROY:
+        if (d) {
+            if (d->hFont) DeleteObject(d->hFont);
+            delete d;
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterPromptCtrl(HINSTANCE hInst)
+{
+    WNDCLASSEX wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = PromptCtrlProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = nullptr; // WM_ERASEBKGND で処理
+    wc.lpszClassName = PROMPT_CTRL_CLASS;
     RegisterClassEx(&wc);
 }
 
@@ -211,6 +392,7 @@ static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 void OutputPanel_Register(HINSTANCE hInst)
 {
     RegisterImageCtrl(hInst);
+    RegisterPromptCtrl(hInst);
 
     WNDCLASSEX wc = {};
     wc.cbSize        = sizeof(wc);
@@ -418,6 +600,10 @@ void OutputPanel_Clear(HWND hPanel)
 
     LayoutPanel(hPanel);
     InvalidateRect(hPanel, nullptr, TRUE);
+
+    // クリア後に新しい入力プロンプトを追加
+    OutputPanel_AddPrompt(hPanel);
+    OutputPanel_ScrollToBottom(hPanel);
 }
 
 // ---- Scroll to bottom -------------------------------------------
@@ -431,4 +617,45 @@ void OutputPanel_ScrollToBottom(HWND hPanel)
     int maxOff = std::max(0, d->totalHeight - (int)rc.bottom);
     d->scrollOffset = maxOff;
     LayoutPanel(hPanel);
+}
+
+// ---- Add prompt -------------------------------------------------
+void OutputPanel_AddPrompt(HWND hPanel)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return;
+
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 200);
+
+    HWND hPrompt = CreateWindowEx(
+        0, PROMPT_CTRL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, 0, panelW, CMDBAR_HEIGHT,
+        hPanel, nullptr, d->hInst, nullptr);
+
+    d->items.push_back({ OutputType::Prompt, hPrompt, CMDBAR_HEIGHT });
+    LayoutPanel(hPanel);
+
+    // 新しいプロンプトにフォーカスを移す
+    auto* pd = (PromptCtrlData*)GetWindowLongPtr(hPrompt, GWLP_USERDATA);
+    if (pd && pd->hEdit) SetFocus(pd->hEdit);
+}
+
+// ---- Focus last prompt ------------------------------------------
+void OutputPanel_FocusPrompt(HWND hPanel)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return;
+
+    for (int i = (int)d->items.size() - 1; i >= 0; --i) {
+        if (d->items[i].type == OutputType::Prompt) {
+            auto* pd = (PromptCtrlData*)GetWindowLongPtr(d->items[i].hwnd, GWLP_USERDATA);
+            if (pd && pd->hEdit && !pd->executed) {
+                SetFocus(pd->hEdit);
+                return;
+            }
+        }
+    }
 }

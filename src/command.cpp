@@ -50,7 +50,11 @@ static std::wstring ResolvePath(const std::wstring& path) {
 void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
     std::wstring cmd, args;
     SplitCmdArgs(cmdLine, cmd, args);
-    if (cmd.empty()) return;
+    if (cmd.empty()) {
+        OutputPanel_AddPrompt(hOutputPanel);
+        OutputPanel_ScrollToBottom(hOutputPanel);
+        return;
+    }
 
     // ---- hello ------------------------------------------------
     if (cmd == L"hello") {
@@ -119,5 +123,6 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
             L"不明なコマンド: " + cmd + L"\n\"help\" で一覧を確認できます。");
     }
 
+    OutputPanel_AddPrompt(hOutputPanel);
     OutputPanel_ScrollToBottom(hOutputPanel);
 }

@@ -14,7 +14,8 @@ enum class OutputType {
     Text,       // テキスト表示 (読み取り専用)
     Image,      // 画像表示
     Edit,       // テキスト編集
-    FileList    // ファイル一覧 (サムネイルリスト)
+    FileList,   // ファイル一覧 (サムネイルリスト)
+    Prompt      // コマンド入力行
 };
 
 // ウィンドウリストビューの各エントリ
