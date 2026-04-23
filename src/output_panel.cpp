@@ -93,7 +93,6 @@ static void RegisterImageCtrl(HINSTANCE hInst)
 #define PROMPT_CTRL_CLASS L"VizCmdPromptCtrl"
 
 struct PromptCtrlData {
-    HWND  hLabel    = nullptr;
     HWND  hEdit     = nullptr;
     HFONT hFont     = nullptr;
     bool  executed  = false;
@@ -103,38 +102,58 @@ struct PromptCtrlData {
 static std::vector<std::wstring> g_cmdHistory;
 static int g_historyIdx = 0;
 
-// EDIT サブクラス: ENTER / ↑↓ キー処理
+// プレフィックス "> " の文字数
+static const int PREFIX_LEN = 2;
+
+// 現在の入力テキスト (プレフィックス除去)
+static std::wstring GetPromptInput(HWND hEdit)
+{
+    wchar_t buf[4096] = {};
+    GetWindowText(hEdit, buf, 4096);
+    std::wstring s(buf);
+    return s.size() >= (size_t)PREFIX_LEN ? s.substr(PREFIX_LEN) : L"";
+}
+
+// カーソルをプレフィックス以前に移動させない
+static void EnforceMinCaret(HWND hEdit)
+{
+    DWORD s = 0, e = 0;
+    SendMessage(hEdit, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
+    if ((int)s < PREFIX_LEN || (int)e < PREFIX_LEN) {
+        DWORD ns = std::max((DWORD)PREFIX_LEN, s);
+        DWORD ne = std::max((DWORD)PREFIX_LEN, e);
+        SendMessage(hEdit, EM_SETSEL, ns, ne);
+    }
+}
+
+// EDIT サブクラス
 static LRESULT CALLBACK PromptEditSubclassProc(
     HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR)
 {
     switch (msg) {
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
+        DWORD selS = 0, selE = 0;
+        SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
+
         switch (wParam) {
         case VK_RETURN: {
-            HWND hPromptCtrl  = GetParent(hwnd);
-            HWND hOutputPanel = GetParent(hPromptCtrl);
-            auto* pd = (PromptCtrlData*)GetWindowLongPtr(hPromptCtrl, GWLP_USERDATA);
+            HWND hOutputPanel = GetParent(GetParent(hwnd));
+            auto* pd = (PromptCtrlData*)GetWindowLongPtr(GetParent(hwnd), GWLP_USERDATA);
             if (pd && !pd->executed) {
-                wchar_t buf[4096] = {};
-                GetWindowText(hwnd, buf, 4096);
-                std::wstring cmd(buf);
+                std::wstring cmd = GetPromptInput(hwnd);
 
-                // EDIT を読み取り専用に固定
                 pd->executed = true;
                 LONG style = GetWindowLong(hwnd, GWL_STYLE);
                 SetWindowLong(hwnd, GWL_STYLE, style | ES_READONLY);
                 SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
-                // 履歴追加
                 if (!cmd.empty()) {
                     if (g_cmdHistory.empty() || g_cmdHistory.back() != cmd)
                         g_cmdHistory.push_back(cmd);
                     g_historyIdx = (int)g_cmdHistory.size();
                 }
-
-                // コマンド実行 (AddPrompt + ScrollToBottom は command.cpp 側で行う)
                 ExecuteCommand(hOutputPanel, cmd);
             }
             return 0;
@@ -142,9 +161,9 @@ static LRESULT CALLBACK PromptEditSubclassProc(
         case VK_UP:
             if (!g_cmdHistory.empty() && g_historyIdx > 0) {
                 --g_historyIdx;
-                SetWindowText(hwnd, g_cmdHistory[g_historyIdx].c_str());
-                int len = (int)g_cmdHistory[g_historyIdx].size();
-                SendMessage(hwnd, EM_SETSEL, len, len);
+                std::wstring t = L"> " + g_cmdHistory[g_historyIdx];
+                SetWindowText(hwnd, t.c_str());
+                SendMessage(hwnd, EM_SETSEL, (WPARAM)t.size(), (LPARAM)t.size());
             }
             return 0;
         case VK_DOWN:
@@ -152,16 +171,62 @@ static LRESULT CALLBACK PromptEditSubclassProc(
                 ++g_historyIdx;
                 if (g_historyIdx >= (int)g_cmdHistory.size()) {
                     g_historyIdx = (int)g_cmdHistory.size();
-                    SetWindowText(hwnd, L"");
+                    SetWindowText(hwnd, L"> ");
+                    SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
                 } else {
-                    SetWindowText(hwnd, g_cmdHistory[g_historyIdx].c_str());
-                    int len = (int)g_cmdHistory[g_historyIdx].size();
-                    SendMessage(hwnd, EM_SETSEL, len, len);
+                    std::wstring t = L"> " + g_cmdHistory[g_historyIdx];
+                    SetWindowText(hwnd, t.c_str());
+                    SendMessage(hwnd, EM_SETSEL, (WPARAM)t.size(), (LPARAM)t.size());
                 }
             }
             return 0;
+        case VK_LEFT:
+            if ((int)selS <= PREFIX_LEN) return 0;  // プレフィックス前に戻れない
+            break;
+        case VK_HOME:
+            SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
+            return 0;
+        case VK_BACK:
+            if ((int)selS <= PREFIX_LEN && selS == selE) return 0;
+            if ((int)selS < PREFIX_LEN) {
+                SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, selE);
+                SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
+                return 0;
+            }
+            break;
+        case VK_DELETE:
+            if ((int)selS < PREFIX_LEN && selS == selE) return 0;
+            break;
         }
         break;
+    }
+
+    case WM_CHAR:
+        // バックスペースをプレフィックス保護
+        if (wParam == VK_BACK) {
+            DWORD selS = 0, selE = 0;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
+            if ((int)selS <= PREFIX_LEN && selS == selE) return 0;
+        }
+        break;
+
+    // マウスクリックによるカーソル移動を無効化
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        SetFocus(hwnd);
+        {
+            int len = GetWindowTextLength(hwnd);
+            SendMessage(hwnd, EM_SETSEL, len, len);
+        }
+        return 0;
+
+    // マウスカーソルを矢印のまま (Iビームにしない)
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return TRUE;
+
     case WM_NCDESTROY:
         RemoveWindowSubclass(hwnd, PromptEditSubclassProc, uIdSubclass);
         break;
@@ -169,7 +234,13 @@ static LRESULT CALLBACK PromptEditSubclassProc(
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-static HBRUSH g_hPromptBrush = nullptr; // 背景ブラシ (一度だけ作成)
+static HBRUSH g_hConBrush = nullptr; // コンソール背景ブラシ (一度だけ作成)
+
+static HBRUSH ConBrush()
+{
+    if (!g_hConBrush) g_hConBrush = CreateSolidBrush(CON_BG);
+    return g_hConBrush;
+}
 
 static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -180,28 +251,21 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         auto* cs   = (CREATESTRUCT*)lParam;
         auto* data = new PromptCtrlData{};
         data->hFont = CreateFont(
-            18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
 
-        data->hLabel = CreateWindow(
-            L"STATIC", L">",
-            WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
-            0, 0, 26, CMDBAR_HEIGHT,
-            hwnd, nullptr, cs->hInstance, nullptr);
-        SendMessage(data->hLabel, WM_SETFONT, (WPARAM)data->hFont, FALSE);
-
         RECT rc = {};
         GetClientRect(hwnd, &rc);
-        int editW = std::max((int)rc.right - 26, 1);
+        int editW = std::max((int)rc.right, 1);
+        // EDIT に "> " プレフィックスを初期テキストとして設定
         data->hEdit = CreateWindowEx(
-            0, L"EDIT", L"",
+            0, L"EDIT", L"> ",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            26, 0, editW, CMDBAR_HEIGHT,
+            0, 0, editW, CMDBAR_HEIGHT,
             hwnd, nullptr, cs->hInstance, nullptr);
         SendMessage(data->hEdit, WM_SETFONT, (WPARAM)data->hFont, FALSE);
-        SendMessage(data->hEdit, EM_SETCUEBANNER, 0,
-                    (LPARAM)L"コマンドを入力 (help で一覧)");
+        SendMessage(data->hEdit, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
         SetWindowSubclass(data->hEdit, PromptEditSubclassProc, 1, 0);
 
         SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
@@ -211,8 +275,7 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_SIZE:
         if (d) {
             int w = LOWORD(lParam);
-            MoveWindow(d->hLabel, 0,  0, 26,       CMDBAR_HEIGHT, TRUE);
-            MoveWindow(d->hEdit,  26, 0, w - 26,   CMDBAR_HEIGHT, TRUE);
+            MoveWindow(d->hEdit, 0, 0, w, CMDBAR_HEIGHT, TRUE);
         }
         break;
 
@@ -220,30 +283,18 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         HDC hdc = (HDC)wParam;
         RECT rc;
         GetClientRect(hwnd, &rc);
-        if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
-        FillRect(hdc, &rc, g_hPromptBrush);
+        FillRect(hdc, &rc, ConBrush());
         return 1;
     }
 
+    // 通常時 (編集可能) と読み取り専用時の両方に対応
     case WM_CTLCOLOREDIT:
-        if (d && (HWND)lParam == d->hEdit) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, RGB(245, 245, 245));
-            SetTextColor(hdc, RGB(30, 30, 30));
-            if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
-            return (LRESULT)g_hPromptBrush;
-        }
-        break;
-
-    case WM_CTLCOLORSTATIC:
-        if (d && (HWND)lParam == d->hLabel) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, RGB(245, 245, 245));
-            SetTextColor(hdc, RGB(0, 128, 0));
-            if (!g_hPromptBrush) g_hPromptBrush = CreateSolidBrush(RGB(245, 245, 245));
-            return (LRESULT)g_hPromptBrush;
-        }
-        break;
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, CON_BG);
+        SetTextColor(hdc, CON_FG);
+        return (LRESULT)ConBrush();
+    }
 
     case WM_DESTROY:
         if (d) {
@@ -371,11 +422,19 @@ static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         break;
     }
 
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, CON_BG);
+        SetTextColor(hdc, CON_FG);
+        return (LRESULT)ConBrush();
+    }
+
     case WM_ERASEBKGND: {
         HDC hdc = (HDC)wParam;
         RECT rc;
         GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
+        FillRect(hdc, &rc, ConBrush());
         return 1;
     }
 
@@ -398,7 +457,7 @@ void OutputPanel_Register(HINSTANCE hInst)
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = OutputPanelProc;
     wc.hInstance     = hInst;
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr; // WM_ERASEBKGND で処理
     wc.lpszClassName = OUTPUT_PANEL_CLASS;
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     RegisterClassEx(&wc);
@@ -424,8 +483,17 @@ void OutputPanel_AddText(HWND hPanel, const std::wstring& text)
     GetClientRect(hPanel, &rcPanel);
     int panelW = std::max((int)rcPanel.right, 200);
 
+    // EDIT コントロールは \r\n を改行として認識する
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\n' && (i == 0 || text[i-1] != L'\r'))
+            normalized += L'\r';
+        normalized += text[i];
+    }
+
     HWND hEdit = CreateWindowEx(
-        0, L"EDIT", text.c_str(),
+        0, L"EDIT", normalized.c_str(),
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, panelW, 100,
         hPanel, nullptr, d->hInst, nullptr);
@@ -543,6 +611,10 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
         WS_CHILD | WS_VISIBLE | LVS_ICON | LVS_AUTOARRANGE,
         0, 0, 100, 100,
         hPanel, nullptr, d->hInst, nullptr);
+
+    ListView_SetBkColor(hList, CON_BG);
+    ListView_SetTextBkColor(hList, CON_BG);
+    ListView_SetTextColor(hList, CON_FG);
 
     SHFILEINFO sfi = {};
     HIMAGELIST hSysImg = (HIMAGELIST)SHGetFileInfo(

@@ -93,7 +93,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = MainWndProc;
     wc.hInstance     = hInst;
-    wc.hbrBackground = CreateSolidBrush(RGB(245, 245, 245));
+    wc.hbrBackground = CreateSolidBrush(CON_BG);
     wc.lpszClassName = L"VizCommandMain";
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
