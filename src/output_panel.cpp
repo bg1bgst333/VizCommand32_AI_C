@@ -210,22 +210,21 @@ static LRESULT CALLBACK PromptEditSubclassProc(
         }
         break;
 
-    // マウスクリックによるカーソル移動を無効化
+    // クリック/ドラッグ後にプレフィックス前へのカーソル移動を矯正
     case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK:
-    case WM_MBUTTONDOWN:
-    case WM_RBUTTONDOWN:
-        SetFocus(hwnd);
-        {
-            int len = GetWindowTextLength(hwnd);
-            SendMessage(hwnd, EM_SETSEL, len, len);
-        }
-        return 0;
+    case WM_LBUTTONDBLCLK: {
+        LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+        EnforceMinCaret(hwnd);
+        return r;
+    }
 
-    // マウスカーソルを矢印のまま (Iビームにしない)
-    case WM_SETCURSOR:
-        SetCursor(LoadCursor(nullptr, IDC_ARROW));
-        return TRUE;
+    case WM_MOUSEMOVE:
+        if (wParam & MK_LBUTTON) {
+            LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+            EnforceMinCaret(hwnd);
+            return r;
+        }
+        break;
 
     case WM_NCDESTROY:
         RemoveWindowSubclass(hwnd, PromptEditSubclassProc, uIdSubclass);
