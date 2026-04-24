@@ -635,36 +635,37 @@ void OutputPanel_AddImage(HWND hPanel, const std::wstring& path)
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    FinalizeActiveConsole(hPanel);
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 100);
 
-    HWND hImg = CreateWindowEx(
-        0, IMAGE_CTRL_CLASS, nullptr,
-        WS_CHILD | WS_VISIBLE,
-        0, 0, 100, 100,
-        hPanel, nullptr, d->hInst, nullptr);
-
-    auto* imgData = (ImageCtrlData*)GetWindowLongPtr(hImg, GWLP_USERDATA);
-    if (imgData) {
-        imgData->path   = path;
-        imgData->pImage = Gdiplus::Image::FromFile(path.c_str());
-        if (imgData->pImage && imgData->pImage->GetLastStatus() != Gdiplus::Ok) {
-            delete imgData->pImage;
-            imgData->pImage = nullptr;
-        }
-    }
+    // 画像サイズを先に取得して高さを確定
+    Gdiplus::Image* pImg = Gdiplus::Image::FromFile(path.c_str());
+    if (pImg && pImg->GetLastStatus() != Gdiplus::Ok) { delete pImg; pImg = nullptr; }
 
     int height = 300;
-    if (imgData && imgData->pImage) {
-        UINT iw = imgData->pImage->GetWidth();
-        UINT ih = imgData->pImage->GetHeight();
-        RECT rcPanel;
-        GetClientRect(hPanel, &rcPanel);
-        int pw = std::max((int)rcPanel.right, 100);
+    if (pImg) {
+        UINT iw = pImg->GetWidth();
+        UINT ih = pImg->GetHeight();
         if (iw > 0 && ih > 0) {
-            height = (int)((float)ih / iw * pw);
+            height = (int)((float)ih / iw * panelW);
             height = std::max(50, std::min(height, 500));
         }
     }
+
+    FinalizeActiveConsole(hPanel);
+
+    // 確定したサイズ・位置で直接生成
+    int yPos = d->totalHeight - d->scrollOffset;
+    HWND hImg = CreateWindowEx(
+        0, IMAGE_CTRL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE,
+        0, yPos, panelW, height,
+        hPanel, nullptr, d->hInst, nullptr);
+
+    auto* imgData = (ImageCtrlData*)GetWindowLongPtr(hImg, GWLP_USERDATA);
+    if (imgData) { imgData->path = path; imgData->pImage = pImg; pImg = nullptr; }
+    delete pImg;
 
     d->items.push_back({ OutputType::Image, hImg, height });
     LayoutPanel(hPanel);
@@ -690,17 +691,23 @@ void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
 
     FinalizeActiveConsole(hPanel);
 
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 200);
+    int editH  = 280;
+    int yPos   = d->totalHeight - d->scrollOffset;
+
     HWND hEdit = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", content.c_str(),
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL
             | WS_VSCROLL | WS_HSCROLL,
-        0, 0, 100, 100,
+        0, yPos, panelW, editH,
         hPanel, nullptr, d->hInst, nullptr);
 
     if (d->hFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
     SetProp(hEdit, L"FilePath", (HANDLE)new std::wstring(filePath));
 
-    d->items.push_back({ OutputType::Edit, hEdit, 280 });
+    d->items.push_back({ OutputType::Edit, hEdit, editH });
     LayoutPanel(hPanel);
 }
 
@@ -721,10 +728,16 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
 
     FinalizeActiveConsole(hPanel);
 
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 200);
+    int listH  = 260;
+    int yPos   = d->totalHeight - d->scrollOffset;
+
     HWND hList = CreateWindowEx(
         WS_EX_CLIENTEDGE, WC_LISTVIEW, nullptr,
         WS_CHILD | WS_VISIBLE | LVS_ICON | LVS_AUTOARRANGE,
-        0, 0, 100, 100,
+        0, yPos, panelW, listH,
         hPanel, nullptr, d->hInst, nullptr);
 
     ListView_SetBkColor(hList, CON_BG);
@@ -765,7 +778,7 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
     } while (FindNextFile(hFind, &ffd));
     FindClose(hFind);
 
-    d->items.push_back({ OutputType::FileList, hList, 260 });
+    d->items.push_back({ OutputType::FileList, hList, listH });
     LayoutPanel(hPanel);
 }
 
