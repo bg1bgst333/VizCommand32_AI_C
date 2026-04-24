@@ -75,9 +75,9 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
             }
         }
     }
-    // ---- list ------------------------------------------------
+    // ---- list [パス] -----------------------------------------
     else if (cmd == L"list") {
-        OutputPanel_AddFileList(hOutputPanel, g_currentDir);
+        OutputPanel_AddFileList(hOutputPanel, args.empty() ? g_currentDir : ResolvePath(args));
     }
     // ---- view <ファイル> -------------------------------------
     else if (cmd == L"view") {
