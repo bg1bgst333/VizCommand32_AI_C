@@ -63,7 +63,6 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
     // ---- walk <パス> -----------------------------------------
     else if (cmd == L"walk") {
         if (args.empty()) {
-            // 引数なし: カレントディレクトリを表示
             OutputPanel_AddText(hOutputPanel, g_currentDir);
         } else {
             std::wstring newDir = ResolvePath(args);
@@ -99,7 +98,7 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
     // ---- clear / cls -----------------------------------------
     else if (cmd == L"clear" || cmd == L"cls") {
         OutputPanel_Clear(hOutputPanel);
-        return; // スクロール操作不要
+        return;
     }
     // ---- help ------------------------------------------------
     else if (cmd == L"help") {
