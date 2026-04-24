@@ -494,8 +494,21 @@ static void DoScroll(HWND hPanel, PanelData* d, int newOffset)
     RECT rc;
     GetClientRect(hPanel, &rc);
     int maxOff = std::max(0, d->totalHeight - (int)rc.bottom);
+    int oldOffset = d->scrollOffset;
     d->scrollOffset = std::max(0, std::min(newOffset, maxOff));
-    LayoutPanel(hPanel);
+    int dy = oldOffset - d->scrollOffset;
+    if (dy == 0) return;
+
+    // 子ウィンドウごとスクロールし、露出した帯域のみ無効化
+    ScrollWindowEx(hPanel, 0, dy, nullptr, nullptr,
+                   nullptr, nullptr,
+                   SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask  = SIF_POS;
+    si.nPos   = d->scrollOffset;
+    SetScrollInfo(hPanel, SB_VERT, &si, TRUE);
 }
 
 static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -854,10 +867,10 @@ void OutputPanel_AddTextView(HWND hPanel, const std::wstring& filePath)
     int panelW = std::max((int)rcPanel.right, 200);
     int yPos   = d->totalHeight - d->scrollOffset;
 
+    // スクロール不要な状態で作成して正確な高さを測定
     HWND hEdit = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", content.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY
-            | ES_AUTOVSCROLL | WS_VSCROLL | WS_HSCROLL,
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
         0, yPos, panelW, 9999,
         hPanel, nullptr, d->hInst, nullptr);
 
@@ -877,11 +890,24 @@ void OutputPanel_AddTextView(HWND hPanel, const std::wstring& filePath)
         LRESULT pos = SendMessage(hEdit, EM_POSFROMCHAR, (WPARAM)(textLen - 1), 0);
         lastLineY = (int)HIWORD((DWORD)pos);
     }
-    int lineH   = tm.tmHeight + tm.tmExternalLeading;
-    int edgePx  = GetSystemMetrics(SM_CYEDGE) * 2;  // WS_EX_CLIENTEDGE の上下枠
-    int contentH = lastLineY + lineH + 4;            // +4 は EDIT 内部の上余白
-    int viewH   = std::min(std::max(contentH + edgePx, 24), 600);
-    MoveWindow(hEdit, 0, yPos, panelW, viewH, FALSE);
+    int lineH    = tm.tmHeight + tm.tmExternalLeading;
+    int edgePx   = GetSystemMetrics(SM_CYEDGE) * 2;
+    int contentH = lastLineY + lineH + 4 + edgePx;  // +4 は EDIT 内部の上余白
+
+    // パネル高さ - プロンプト1行分 を超えた場合のみ縦スクロールバーを付ける
+    int panelH = std::max((int)rcPanel.bottom, CMDBAR_HEIGHT * 2);
+    int maxH   = panelH - CMDBAR_HEIGHT;
+    int viewH;
+    if (contentH > maxH) {
+        viewH = std::max(maxH, 24);
+        SetWindowLong(hEdit, GWL_STYLE,
+            GetWindowLong(hEdit, GWL_STYLE) | WS_VSCROLL | ES_AUTOVSCROLL);
+        SetWindowPos(hEdit, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    } else {
+        viewH = std::max(contentH, 24);
+    }
+    MoveWindow(hEdit, 0, yPos, panelW, viewH, TRUE);
 
     d->items.push_back({ OutputType::TextView, hEdit, viewH });
     LayoutPanel(hPanel);
