@@ -15,7 +15,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 // ================================================================
-// ImageCtrl  GDI+ image display custom control
+// ImageCtrl  GDI+ 画像表示カスタムコントロール
 // ================================================================
 #define IMAGE_CTRL_CLASS L"VizCmdImageCtrl"
 
@@ -88,167 +88,172 @@ static void RegisterImageCtrl(HINSTANCE hInst)
 }
 
 // ================================================================
-// PromptCtrl  コマンド入力行 ("> [EDIT]" をインラインに表示)
+// ConsoleCtrl  テキスト入出力共用コンソール EDIT
 // ================================================================
-#define PROMPT_CTRL_CLASS L"VizCmdPromptCtrl"
+#define CONSOLE_CTRL_CLASS L"VizCmdConsoleCtrl"
 
-struct PromptCtrlData {
-    HWND  hEdit     = nullptr;
-    HFONT hFont     = nullptr;
-    bool  executed  = false;
+struct ConsoleCtrlData {
+    HWND  hEdit;
+    HFONT hFont;
+    int   inputStart;  // ユーザー入力開始位置 (この位置より前は保護)
+    bool  finalized;   // true になると入力を受け付けない
 };
 
-// コマンド履歴 (全プロンプトで共有)
+// コマンド履歴 (全コンソール共有)
 static std::vector<std::wstring> g_cmdHistory;
 static int g_historyIdx = 0;
 
-// プレフィックス "> " の文字数
-static const int PREFIX_LEN = 2;
-
-// 現在の入力テキスト (プレフィックス除去)
-static std::wstring GetPromptInput(HWND hEdit)
+// \n → \r\n 正規化
+static std::wstring NormalizeNewlines(const std::wstring& s)
 {
-    wchar_t buf[4096] = {};
-    GetWindowText(hEdit, buf, 4096);
-    std::wstring s(buf);
-    return s.size() >= (size_t)PREFIX_LEN ? s.substr(PREFIX_LEN) : L"";
-}
-
-// カーソルをプレフィックス以前に移動させない
-static void EnforceMinCaret(HWND hEdit)
-{
-    DWORD s = 0, e = 0;
-    SendMessage(hEdit, EM_GETSEL, (WPARAM)&s, (LPARAM)&e);
-    if ((int)s < PREFIX_LEN || (int)e < PREFIX_LEN) {
-        DWORD ns = std::max((DWORD)PREFIX_LEN, s);
-        DWORD ne = std::max((DWORD)PREFIX_LEN, e);
-        SendMessage(hEdit, EM_SETSEL, ns, ne);
+    std::wstring r;
+    r.reserve(s.size() * 2);
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'\n' && (i == 0 || s[i-1] != L'\r'))
+            r += L'\r';
+        r += s[i];
     }
+    return r;
 }
+
+// ConsoleCtrl の高さを計測して OutputPanel のアイテム高を更新しレイアウト
+static void ResizeConsole(HWND hConsole);
 
 // EDIT サブクラス
-static LRESULT CALLBACK PromptEditSubclassProc(
+static LRESULT CALLBACK ConsoleEditSubclassProc(
     HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR)
 {
+    HWND hConsole = GetParent(hwnd);
+    auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(hConsole, GWLP_USERDATA);
+
     switch (msg) {
     case WM_KEYDOWN: {
+        if (!cd) break;
         DWORD selS = 0, selE = 0;
         SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
 
         switch (wParam) {
         case VK_RETURN: {
-            HWND hOutputPanel = GetParent(GetParent(hwnd));
-            auto* pd = (PromptCtrlData*)GetWindowLongPtr(GetParent(hwnd), GWLP_USERDATA);
-            if (pd && !pd->executed) {
-                std::wstring cmd = GetPromptInput(hwnd);
+            if (cd->finalized) return 0;
+            HWND hOutputPanel = GetParent(hConsole);
 
-                pd->executed = true;
-                LONG style = GetWindowLong(hwnd, GWL_STYLE);
-                SetWindowLong(hwnd, GWL_STYLE, style | ES_READONLY);
-                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            int len = GetWindowTextLength(hwnd);
+            std::wstring full(len + 1, L'\0');
+            GetWindowText(hwnd, &full[0], len + 1);
+            full.resize(len);
 
-                if (!cmd.empty()) {
-                    if (g_cmdHistory.empty() || g_cmdHistory.back() != cmd)
-                        g_cmdHistory.push_back(cmd);
-                    g_historyIdx = (int)g_cmdHistory.size();
-                }
-                ExecuteCommand(hOutputPanel, cmd);
+            // inputStart 以降がコマンド
+            std::wstring cmd;
+            if (cd->inputStart >= 0 && cd->inputStart <= len)
+                cmd = full.substr(cd->inputStart);
+            while (!cmd.empty() && (cmd.back() == L'\r' || cmd.back() == L'\n'))
+                cmd.pop_back();
+
+            if (!cmd.empty()) {
+                if (g_cmdHistory.empty() || g_cmdHistory.back() != cmd)
+                    g_cmdHistory.push_back(cmd);
+                g_historyIdx = (int)g_cmdHistory.size();
             }
+
+            ExecuteCommand(hOutputPanel, cmd);
             return 0;
         }
         case VK_UP:
+            if (cd->finalized) break;
             if (!g_cmdHistory.empty() && g_historyIdx > 0) {
                 --g_historyIdx;
-                std::wstring t = L"> " + g_cmdHistory[g_historyIdx];
-                SetWindowText(hwnd, t.c_str());
-                SendMessage(hwnd, EM_SETSEL, (WPARAM)t.size(), (LPARAM)t.size());
+                SendMessage(hwnd, EM_SETSEL, cd->inputStart, -1);
+                SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_cmdHistory[g_historyIdx].c_str());
             }
             return 0;
         case VK_DOWN:
+            if (cd->finalized) break;
             if (!g_cmdHistory.empty()) {
                 ++g_historyIdx;
                 if (g_historyIdx >= (int)g_cmdHistory.size()) {
                     g_historyIdx = (int)g_cmdHistory.size();
-                    SetWindowText(hwnd, L"> ");
-                    SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
+                    SendMessage(hwnd, EM_SETSEL, cd->inputStart, -1);
+                    SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)L"");
                 } else {
-                    std::wstring t = L"> " + g_cmdHistory[g_historyIdx];
-                    SetWindowText(hwnd, t.c_str());
-                    SendMessage(hwnd, EM_SETSEL, (WPARAM)t.size(), (LPARAM)t.size());
+                    SendMessage(hwnd, EM_SETSEL, cd->inputStart, -1);
+                    SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)g_cmdHistory[g_historyIdx].c_str());
                 }
             }
             return 0;
-        case VK_LEFT:
-            if ((int)selS <= PREFIX_LEN) return 0;  // プレフィックス前に戻れない
-            break;
         case VK_HOME:
-            SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
-            return 0;
+            if (!cd->finalized) {
+                SendMessage(hwnd, EM_SETSEL, cd->inputStart, cd->inputStart);
+                return 0;
+            }
+            break;
+        case VK_LEFT:
+            if (!cd->finalized && (int)selS <= cd->inputStart && selS == selE)
+                return 0;
+            break;
         case VK_BACK:
-            if ((int)selS <= PREFIX_LEN && selS == selE) return 0;
-            if ((int)selS < PREFIX_LEN) {
-                SendMessage(hwnd, EM_SETSEL, PREFIX_LEN, selE);
+            if (cd->finalized) return 0;
+            if ((int)selS <= cd->inputStart && selS == selE) return 0;
+            if ((int)selS < cd->inputStart) {
+                SendMessage(hwnd, EM_SETSEL, cd->inputStart, selE);
                 SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
                 return 0;
             }
             break;
         case VK_DELETE:
-            if ((int)selS < PREFIX_LEN && selS == selE) return 0;
+            if (cd->finalized) return 0;
+            if ((int)selS < cd->inputStart && selS == selE) return 0;
             break;
         }
         break;
     }
 
     case WM_CHAR:
-        // バックスペースをプレフィックス保護
+        // Enter の改行挿入を抑制
+        if (wParam == L'\r' || wParam == L'\n') return 0;
+        if (!cd || cd->finalized) return 0;
+        // Backspace は WM_KEYDOWN で保護済み
         if (wParam == VK_BACK) {
             DWORD selS = 0, selE = 0;
             SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
-            if ((int)selS <= PREFIX_LEN && selS == selE) return 0;
+            if ((int)selS <= cd->inputStart && selS == selE) return 0;
+            break;
         }
-        break;
-
-    // クリック/ドラッグ後にプレフィックス前へのカーソル移動を矯正
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK: {
-        LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
-        EnforceMinCaret(hwnd);
-        return r;
-    }
-
-    case WM_MOUSEMOVE:
-        if (wParam & MK_LBUTTON) {
-            LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
-            EnforceMinCaret(hwnd);
-            return r;
+        // 入力域より前にカーソルがある場合は末尾へ移動してから入力
+        {
+            DWORD selS = 0, selE = 0;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
+            if ((int)selS < cd->inputStart) {
+                int len = GetWindowTextLength(hwnd);
+                SendMessage(hwnd, EM_SETSEL, len, len);
+            }
         }
         break;
 
     case WM_NCDESTROY:
-        RemoveWindowSubclass(hwnd, PromptEditSubclassProc, uIdSubclass);
+        RemoveWindowSubclass(hwnd, ConsoleEditSubclassProc, uIdSubclass);
         break;
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-static HBRUSH g_hConBrush = nullptr; // コンソール背景ブラシ (一度だけ作成)
-
+static HBRUSH g_hConBrush = nullptr;
 static HBRUSH ConBrush()
 {
     if (!g_hConBrush) g_hConBrush = CreateSolidBrush(CON_BG);
     return g_hConBrush;
 }
 
-static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK ConsoleCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    auto* d = (PromptCtrlData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    auto* d = (ConsoleCtrlData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_CREATE: {
         auto* cs   = (CREATESTRUCT*)lParam;
-        auto* data = new PromptCtrlData{};
+        auto* data = new ConsoleCtrlData{};
+        data->inputStart = 0;
+        data->finalized  = false;
         data->hFont = CreateFont(
             16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -257,24 +262,29 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         RECT rc = {};
         GetClientRect(hwnd, &rc);
         int editW = std::max((int)rc.right, 1);
-        // EDIT に "> " プレフィックスを初期テキストとして設定
+
         data->hEdit = CreateWindowEx(
-            0, L"EDIT", L"> ",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL,
             0, 0, editW, CMDBAR_HEIGHT,
             hwnd, nullptr, cs->hInstance, nullptr);
         SendMessage(data->hEdit, WM_SETFONT, (WPARAM)data->hFont, FALSE);
-        SendMessage(data->hEdit, EM_SETSEL, PREFIX_LEN, PREFIX_LEN);
-        SetWindowSubclass(data->hEdit, PromptEditSubclassProc, 1, 0);
+        SendMessage(data->hEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(2, 0));
+        { RECT fmt = {2, 0, editW, CMDBAR_HEIGHT}; SendMessage(data->hEdit, EM_SETRECT, 0, (LPARAM)&fmt); }
+        SetWindowSubclass(data->hEdit, ConsoleEditSubclassProc, 1, 0);
 
         SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
         break;
     }
 
     case WM_SIZE:
-        if (d) {
+        if (d && d->hEdit) {
             int w = LOWORD(lParam);
-            MoveWindow(d->hEdit, 0, 0, w, CMDBAR_HEIGHT, TRUE);
+            int h = HIWORD(lParam);
+            int editH = std::max(h, CMDBAR_HEIGHT);
+            MoveWindow(d->hEdit, 0, 0, w, editH, TRUE);
+            RECT fmt = {2, 0, w, editH};
+            SendMessage(d->hEdit, EM_SETRECT, 0, (LPARAM)&fmt);
         }
         break;
 
@@ -286,7 +296,6 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         return 1;
     }
 
-    // 通常時 (編集可能) と読み取り専用時の両方に対応
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wParam;
@@ -306,19 +315,19 @@ static LRESULT CALLBACK PromptCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static void RegisterPromptCtrl(HINSTANCE hInst)
+static void RegisterConsoleCtrl(HINSTANCE hInst)
 {
     WNDCLASSEX wc = {};
     wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = PromptCtrlProc;
+    wc.lpfnWndProc   = ConsoleCtrlProc;
     wc.hInstance     = hInst;
-    wc.hbrBackground = nullptr; // WM_ERASEBKGND で処理
-    wc.lpszClassName = PROMPT_CTRL_CLASS;
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = CONSOLE_CTRL_CLASS;
     RegisterClassEx(&wc);
 }
 
 // ================================================================
-// OutputPanel  Vertically scrollable window list view
+// OutputPanel  縦スクロール可能なアイテムリスト
 // ================================================================
 struct PanelData {
     std::vector<OutputItem> items;
@@ -343,15 +352,15 @@ static void LayoutPanel(HWND hPanel)
     int panelW = rc.right;
     int panelH = rc.bottom;
 
-    int y = ITEM_MARGIN - d->scrollOffset;
+    int y = -d->scrollOffset;
     for (auto& item : d->items) {
         MoveWindow(item.hwnd, 0, y, panelW, item.height, TRUE);
-        y += item.height + ITEM_MARGIN;
+        y += item.height;
     }
 
-    d->totalHeight = ITEM_MARGIN;
+    d->totalHeight = 0;
     for (auto& item : d->items)
-        d->totalHeight += item.height + ITEM_MARGIN;
+        d->totalHeight += item.height;
 
     SCROLLINFO si = {};
     si.cbSize = sizeof(si);
@@ -445,18 +454,114 @@ static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 }
 
 // ================================================================
+// ConsoleCtrl ヘルパー (OutputPanel 内部)
+// ================================================================
+
+// ConsoleCtrl の内容高を計測して OutputPanel のアイテム高を更新
+static void ResizeConsole(HWND hConsole)
+{
+    HWND hPanel = GetParent(hConsole);
+    PanelData* pd = GetData(hPanel);
+    if (!pd) return;
+
+    auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(hConsole, GWLP_USERDATA);
+    if (!cd || !cd->hEdit) return;
+
+    // 現在の EDIT 幅を取得
+    RECT rc;
+    GetClientRect(hConsole, &rc);
+    int editW = std::max((int)rc.right, 200);
+
+    // 計測のため大きな高さに一時設定
+    MoveWindow(cd->hEdit, 0, 0, editW, 9999, FALSE);
+
+    // ES_AUTOHSCROLL (折り返しなし) なので EM_GETLINECOUNT = 実際の行数
+    int lineCount = (int)SendMessage(cd->hEdit, EM_GETLINECOUNT, 0, 0);
+    lineCount = std::max(lineCount, 1);
+
+    TEXTMETRIC tm;
+    HDC hdc = GetDC(cd->hEdit);
+    HFONT hOld = cd->hFont ? (HFONT)SelectObject(hdc, cd->hFont) : nullptr;
+    GetTextMetrics(hdc, &tm);
+    if (hOld) SelectObject(hdc, hOld);
+    ReleaseDC(cd->hEdit, hdc);
+
+    int lineH    = tm.tmHeight + tm.tmExternalLeading;
+    int newHeight = std::max(lineCount * lineH + 2, CMDBAR_HEIGHT);
+
+    for (auto& item : pd->items) {
+        if (item.hwnd == hConsole) {
+            item.height = newHeight;
+            break;
+        }
+    }
+    LayoutPanel(hPanel); // MoveWindow(hConsole, newHeight) → WM_SIZE → hEdit + EM_SETRECT
+}
+
+// アクティブな (最後の未完了) ConsoleCtrl を返す。なければ新規作成
+static HWND GetOrCreateActiveConsole(HWND hPanel)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return nullptr;
+
+    for (int i = (int)d->items.size() - 1; i >= 0; --i) {
+        if (d->items[i].type == OutputType::Console) {
+            auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(d->items[i].hwnd, GWLP_USERDATA);
+            if (cd && !cd->finalized)
+                return d->items[i].hwnd;
+        }
+    }
+
+    // 新規作成
+    RECT rc;
+    GetClientRect(hPanel, &rc);
+    int panelW = std::max((int)rc.right, 200);
+
+    HWND hConsole = CreateWindowEx(
+        0, CONSOLE_CTRL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, 0, panelW, CMDBAR_HEIGHT,
+        hPanel, nullptr, d->hInst, nullptr);
+
+    d->items.push_back({ OutputType::Console, hConsole, CMDBAR_HEIGHT });
+    LayoutPanel(hPanel);
+    return hConsole;
+}
+
+// アクティブな ConsoleCtrl をテキスト追記不可にする (GUI アイテム挿入前)
+static void FinalizeActiveConsole(HWND hPanel)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return;
+    for (int i = (int)d->items.size() - 1; i >= 0; --i) {
+        if (d->items[i].type == OutputType::Console) {
+            auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(d->items[i].hwnd, GWLP_USERDATA);
+            if (cd && !cd->finalized) {
+                cd->finalized = true;
+                // ES_READONLY に変更 (選択・コピーは引き続き可能)
+                LONG style = GetWindowLong(cd->hEdit, GWL_STYLE);
+                SetWindowLong(cd->hEdit, GWL_STYLE, style | ES_READONLY);
+                SetWindowPos(cd->hEdit, nullptr, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            }
+            return;
+        }
+    }
+}
+
+// ================================================================
 // Public API
 // ================================================================
 void OutputPanel_Register(HINSTANCE hInst)
 {
     RegisterImageCtrl(hInst);
-    RegisterPromptCtrl(hInst);
+    RegisterConsoleCtrl(hInst);
 
     WNDCLASSEX wc = {};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = OutputPanelProc;
     wc.hInstance     = hInst;
-    wc.hbrBackground = nullptr; // WM_ERASEBKGND で処理
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = OUTPUT_PANEL_CLASS;
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     RegisterClassEx(&wc);
@@ -472,57 +577,65 @@ HWND OutputPanel_Create(HWND hParent, HINSTANCE hInst, int x, int y, int w, int 
         hParent, nullptr, hInst, nullptr);
 }
 
-// ---- Text output ------------------------------------------------
+// ---- テキストをアクティブな ConsoleCtrl に追記 -------------------
 void OutputPanel_AddText(HWND hPanel, const std::wstring& text)
 {
-    PanelData* d = GetData(hPanel);
-    if (!d) return;
+    HWND hConsole = GetOrCreateActiveConsole(hPanel);
+    if (!hConsole) return;
 
-    RECT rcPanel;
-    GetClientRect(hPanel, &rcPanel);
-    int panelW = std::max((int)rcPanel.right, 200);
+    auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(hConsole, GWLP_USERDATA);
+    if (!cd || !cd->hEdit) return;
 
-    // EDIT コントロールは \r\n を改行として認識する
-    std::wstring normalized;
-    normalized.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == L'\n' && (i == 0 || text[i-1] != L'\r'))
-            normalized += L'\r';
-        normalized += text[i];
-    }
+    int len = GetWindowTextLength(cd->hEdit);
+    std::wstring current(len + 1, L'\0');
+    GetWindowText(cd->hEdit, &current[0], len + 1);
+    current.resize(len);
 
-    HWND hEdit = CreateWindowEx(
-        0, L"EDIT", normalized.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        0, 0, panelW, 100,
-        hPanel, nullptr, d->hInst, nullptr);
+    // テキストを追記 (\n → \r\n 正規化)
+    std::wstring appended = (len > 0) ? L"\r\n" : L"";
+    appended += NormalizeNewlines(text);
 
-    if (d->hFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+    SetWindowText(cd->hEdit, (current + appended).c_str());
+    cd->inputStart = GetWindowTextLength(cd->hEdit); // 入力域をここより後ろに設定 (AddPromptで正確に設定)
 
-    int lineCount = (int)SendMessage(hEdit, EM_GETLINECOUNT, 0, 0);
-    lineCount = std::max(lineCount, 1);
-
-    TEXTMETRIC tm;
-    HDC hdc = GetDC(hEdit);
-    HFONT hOld = d->hFont ? (HFONT)SelectObject(hdc, d->hFont) : nullptr;
-    GetTextMetrics(hdc, &tm);
-    if (hOld) SelectObject(hdc, hOld);
-    ReleaseDC(hEdit, hdc);
-
-    int lineH  = tm.tmHeight + tm.tmExternalLeading + 2;
-    int height = lineCount * lineH + 10;
-    height = std::max(height, 24);
-    height = std::min(height, 400);
-
-    d->items.push_back({ OutputType::Text, hEdit, height });
-    LayoutPanel(hPanel);
+    ResizeConsole(hConsole);
 }
 
-// ---- Image display ----------------------------------------------
+// ---- プロンプト "> " をアクティブな ConsoleCtrl に追記 -----------
+void OutputPanel_AddPrompt(HWND hPanel)
+{
+    HWND hConsole = GetOrCreateActiveConsole(hPanel);
+    if (!hConsole) return;
+
+    auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(hConsole, GWLP_USERDATA);
+    if (!cd || !cd->hEdit) return;
+
+    int len = GetWindowTextLength(cd->hEdit);
+    std::wstring current(len + 1, L'\0');
+    GetWindowText(cd->hEdit, &current[0], len + 1);
+    current.resize(len);
+
+    // 先頭なら "> "、それ以外は "\r\n> "
+    std::wstring prompt = (len > 0) ? L"\r\n> " : L"> ";
+    std::wstring newText = current + prompt;
+    SetWindowText(cd->hEdit, newText.c_str());
+
+    cd->inputStart = GetWindowTextLength(cd->hEdit); // "> " の直後
+
+    ResizeConsole(hConsole);
+
+    // フォーカスをここへ
+    SetFocus(cd->hEdit);
+    SendMessage(cd->hEdit, EM_SETSEL, cd->inputStart, cd->inputStart);
+}
+
+// ---- 画像表示 (ConsoleCtrl を分割して挿入) -----------------------
 void OutputPanel_AddImage(HWND hPanel, const std::wstring& path)
 {
     PanelData* d = GetData(hPanel);
     if (!d) return;
+
+    FinalizeActiveConsole(hPanel);
 
     HWND hImg = CreateWindowEx(
         0, IMAGE_CTRL_CLASS, nullptr,
@@ -557,13 +670,12 @@ void OutputPanel_AddImage(HWND hPanel, const std::wstring& path)
     LayoutPanel(hPanel);
 }
 
-// ---- Text editor ------------------------------------------------
+// ---- テキストエディタ --------------------------------------------
 void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
 {
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    // Read file content
     std::wstring content;
     std::wifstream fs(filePath);
     if (fs) {
@@ -575,6 +687,8 @@ void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
         OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
         return;
     }
+
+    FinalizeActiveConsole(hPanel);
 
     HWND hEdit = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", content.c_str(),
@@ -590,7 +704,7 @@ void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
     LayoutPanel(hPanel);
 }
 
-// ---- File list --------------------------------------------------
+// ---- ファイル一覧 -----------------------------------------------
 void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
 {
     PanelData* d = GetData(hPanel);
@@ -604,6 +718,8 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
         OutputPanel_AddText(hPanel, L"Error: directory not found: " + std::wstring(fullPath));
         return;
     }
+
+    FinalizeActiveConsole(hPanel);
 
     HWND hList = CreateWindowEx(
         WS_EX_CLIENTEDGE, WC_LISTVIEW, nullptr,
@@ -626,6 +742,7 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
     HANDLE hFind = FindFirstFile(searchPath.c_str(), &ffd);
     if (hFind == INVALID_HANDLE_VALUE) {
         DestroyWindow(hList);
+        // FinalizeActiveConsole は既に呼んでいるが、AddText で新しいコンソールを使う
         OutputPanel_AddText(hPanel, L"Error: cannot read directory: " + std::wstring(fullPath));
         return;
     }
@@ -652,7 +769,7 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
     LayoutPanel(hPanel);
 }
 
-// ---- Clear ------------------------------------------------------
+// ---- クリア -----------------------------------------------------
 void OutputPanel_Clear(HWND hPanel)
 {
     PanelData* d = GetData(hPanel);
@@ -672,12 +789,11 @@ void OutputPanel_Clear(HWND hPanel)
     LayoutPanel(hPanel);
     InvalidateRect(hPanel, nullptr, TRUE);
 
-    // クリア後に新しい入力プロンプトを追加
     OutputPanel_AddPrompt(hPanel);
     OutputPanel_ScrollToBottom(hPanel);
 }
 
-// ---- Scroll to bottom -------------------------------------------
+// ---- 最下部へスクロール -----------------------------------------
 void OutputPanel_ScrollToBottom(HWND hPanel)
 {
     PanelData* d = GetData(hPanel);
@@ -690,41 +806,18 @@ void OutputPanel_ScrollToBottom(HWND hPanel)
     LayoutPanel(hPanel);
 }
 
-// ---- Add prompt -------------------------------------------------
-void OutputPanel_AddPrompt(HWND hPanel)
-{
-    PanelData* d = GetData(hPanel);
-    if (!d) return;
-
-    RECT rcPanel;
-    GetClientRect(hPanel, &rcPanel);
-    int panelW = std::max((int)rcPanel.right, 200);
-
-    HWND hPrompt = CreateWindowEx(
-        0, PROMPT_CTRL_CLASS, nullptr,
-        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-        0, 0, panelW, CMDBAR_HEIGHT,
-        hPanel, nullptr, d->hInst, nullptr);
-
-    d->items.push_back({ OutputType::Prompt, hPrompt, CMDBAR_HEIGHT });
-    LayoutPanel(hPanel);
-
-    // 新しいプロンプトにフォーカスを移す
-    auto* pd = (PromptCtrlData*)GetWindowLongPtr(hPrompt, GWLP_USERDATA);
-    if (pd && pd->hEdit) SetFocus(pd->hEdit);
-}
-
-// ---- Focus last prompt ------------------------------------------
+// ---- アクティブなコンソールにフォーカス -------------------------
 void OutputPanel_FocusPrompt(HWND hPanel)
 {
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
     for (int i = (int)d->items.size() - 1; i >= 0; --i) {
-        if (d->items[i].type == OutputType::Prompt) {
-            auto* pd = (PromptCtrlData*)GetWindowLongPtr(d->items[i].hwnd, GWLP_USERDATA);
-            if (pd && pd->hEdit && !pd->executed) {
-                SetFocus(pd->hEdit);
+        if (d->items[i].type == OutputType::Console) {
+            auto* cd = (ConsoleCtrlData*)GetWindowLongPtr(d->items[i].hwnd, GWLP_USERDATA);
+            if (cd && cd->hEdit && !cd->finalized) {
+                SetFocus(cd->hEdit);
+                SendMessage(cd->hEdit, EM_SETSEL, cd->inputStart, cd->inputStart);
                 return;
             }
         }
