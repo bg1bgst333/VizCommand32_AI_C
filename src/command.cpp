@@ -44,6 +44,17 @@ static std::wstring ResolvePath(const std::wstring& path) {
     return path;
 }
 
+// 画像ファイルかどうかを拡張子で判定
+static bool IsImageFile(const std::wstring& path)
+{
+    size_t dot = path.rfind(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = path.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    return ext == L"png" || ext == L"jpg" || ext == L"jpeg" ||
+           ext == L"bmp" || ext == L"gif" || ext == L"tif"  || ext == L"tiff";
+}
+
 // ----------------------------------------------------------------
 // コマンド実行
 // ----------------------------------------------------------------
@@ -84,7 +95,11 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
         if (args.empty()) {
             OutputPanel_AddText(hOutputPanel, L"使い方: view <ファイルパス>");
         } else {
-            OutputPanel_AddImage(hOutputPanel, ResolvePath(args));
+            std::wstring p = ResolvePath(args);
+            if (IsImageFile(p))
+                OutputPanel_AddImage(hOutputPanel, p);
+            else
+                OutputPanel_AddTextView(hOutputPanel, p);
         }
     }
     // ---- edit <ファイル> -------------------------------------
@@ -92,7 +107,11 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
         if (args.empty()) {
             OutputPanel_AddText(hOutputPanel, L"使い方: edit <ファイルパス>");
         } else {
-            OutputPanel_AddEdit(hOutputPanel, ResolvePath(args));
+            std::wstring p = ResolvePath(args);
+            if (IsImageFile(p))
+                OutputPanel_AddPaint(hOutputPanel, p);
+            else
+                OutputPanel_AddEdit(hOutputPanel, p);
         }
     }
     // ---- clear / cls -----------------------------------------

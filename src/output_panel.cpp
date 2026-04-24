@@ -1,6 +1,7 @@
 #include "output_panel.h"
 #include "command.h"
 #include <commctrl.h>
+#include <windowsx.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <gdiplus.h>
@@ -84,6 +85,122 @@ static void RegisterImageCtrl(HINSTANCE hInst)
     wc.hInstance     = hInst;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = IMAGE_CTRL_CLASS;
+    RegisterClassEx(&wc);
+}
+
+// ================================================================
+// PaintCtrl  画像編集 (ペイントツール)
+// ================================================================
+#define PAINT_CTRL_CLASS L"VizCmdPaintCtrl"
+
+struct PaintCtrlData {
+    HDC      hMemDC;
+    HBITMAP  hBitmap;
+    int      bmWidth, bmHeight;
+    bool     painting;
+    POINT    lastPt;
+    COLORREF penColor;
+    int      penSize;
+};
+
+static LRESULT CALLBACK PaintCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* d = (PaintCtrlData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* data = new PaintCtrlData{};
+        data->painting  = false;
+        data->penColor  = RGB(0, 0, 0);
+        data->penSize   = 3;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        data->bmWidth  = std::max((int)rc.right,  1);
+        data->bmHeight = std::max((int)rc.bottom, 1);
+
+        HDC hdc = GetDC(hwnd);
+        data->hMemDC  = CreateCompatibleDC(hdc);
+        data->hBitmap = CreateCompatibleBitmap(hdc, data->bmWidth, data->bmHeight);
+        ReleaseDC(hwnd, hdc);
+
+        SelectObject(data->hMemDC, data->hBitmap);
+        RECT fill = {0, 0, data->bmWidth, data->bmHeight};
+        FillRect(data->hMemDC, &fill, (HBRUSH)GetStockObject(WHITE_BRUSH));
+
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        break;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (d) BitBlt(hdc, 0, 0, d->bmWidth, d->bmHeight, d->hMemDC, 0, 0, SRCCOPY);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            SetCursor(LoadCursor(nullptr, IDC_CROSS));
+            return TRUE;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (d) {
+            d->painting = true;
+            d->lastPt   = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            HPEN hPen = CreatePen(PS_SOLID, d->penSize, d->penColor);
+            HPEN hOld = (HPEN)SelectObject(d->hMemDC, hPen);
+            MoveToEx(d->hMemDC, d->lastPt.x, d->lastPt.y, nullptr);
+            LineTo(d->hMemDC, d->lastPt.x, d->lastPt.y + 1);
+            SelectObject(d->hMemDC, hOld);
+            DeleteObject(hPen);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            SetCapture(hwnd);
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (d && d->painting) {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            HPEN hPen = CreatePen(PS_SOLID, d->penSize, d->penColor);
+            HPEN hOld = (HPEN)SelectObject(d->hMemDC, hPen);
+            MoveToEx(d->hMemDC, d->lastPt.x, d->lastPt.y, nullptr);
+            LineTo(d->hMemDC, pt.x, pt.y);
+            SelectObject(d->hMemDC, hOld);
+            DeleteObject(hPen);
+            d->lastPt = pt;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (d) { d->painting = false; ReleaseCapture(); }
+        return 0;
+
+    case WM_DESTROY:
+        if (d) {
+            SelectObject(d->hMemDC, GetStockObject(BLACK_PEN)); // deselect bitmap
+            DeleteDC(d->hMemDC);
+            DeleteObject(d->hBitmap);
+            delete d;
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterPaintCtrl(HINSTANCE hInst)
+{
+    WNDCLASSEX wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = PaintCtrlProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = PAINT_CTRL_CLASS;
     RegisterClassEx(&wc);
 }
 
@@ -555,6 +672,7 @@ static void FinalizeActiveConsole(HWND hPanel)
 void OutputPanel_Register(HINSTANCE hInst)
 {
     RegisterImageCtrl(hInst);
+    RegisterPaintCtrl(hInst);
     RegisterConsoleCtrl(hInst);
 
     WNDCLASSEX wc = {};
@@ -708,6 +826,111 @@ void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
     SetProp(hEdit, L"FilePath", (HANDLE)new std::wstring(filePath));
 
     d->items.push_back({ OutputType::Edit, hEdit, editH });
+    LayoutPanel(hPanel);
+}
+
+// ---- テキストビューワ (読み取り専用) ----------------------------
+void OutputPanel_AddTextView(HWND hPanel, const std::wstring& filePath)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return;
+
+    std::wstring content;
+    std::wifstream fs(filePath);
+    if (fs) {
+        fs.imbue(std::locale(""));
+        std::wstringstream ss;
+        ss << fs.rdbuf();
+        content = NormalizeNewlines(ss.str());
+    } else {
+        OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
+        return;
+    }
+
+    FinalizeActiveConsole(hPanel);
+
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 200);
+    int yPos   = d->totalHeight - d->scrollOffset;
+
+    HWND hEdit = CreateWindowEx(
+        WS_EX_CLIENTEDGE, L"EDIT", content.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY
+            | ES_AUTOVSCROLL | WS_VSCROLL | WS_HSCROLL,
+        0, yPos, panelW, 9999,
+        hPanel, nullptr, d->hInst, nullptr);
+
+    if (d->hFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+    // EM_POSFROMCHAR で最終文字のY座標を取得して正確な高さを算出
+    TEXTMETRIC tm;
+    HDC hdc = GetDC(hEdit);
+    HFONT hOld = d->hFont ? (HFONT)SelectObject(hdc, d->hFont) : nullptr;
+    GetTextMetrics(hdc, &tm);
+    if (hOld) SelectObject(hdc, hOld);
+    ReleaseDC(hEdit, hdc);
+
+    int textLen = GetWindowTextLength(hEdit);
+    int lastLineY = 0;
+    if (textLen > 0) {
+        LRESULT pos = SendMessage(hEdit, EM_POSFROMCHAR, (WPARAM)(textLen - 1), 0);
+        lastLineY = (int)HIWORD((DWORD)pos);
+    }
+    int lineH   = tm.tmHeight + tm.tmExternalLeading;
+    int edgePx  = GetSystemMetrics(SM_CYEDGE) * 2;  // WS_EX_CLIENTEDGE の上下枠
+    int contentH = lastLineY + lineH + 4;            // +4 は EDIT 内部の上余白
+    int viewH   = std::min(std::max(contentH + edgePx, 24), 600);
+    MoveWindow(hEdit, 0, yPos, panelW, viewH, FALSE);
+
+    d->items.push_back({ OutputType::TextView, hEdit, viewH });
+    LayoutPanel(hPanel);
+}
+
+// ---- ペイントツール ---------------------------------------------
+void OutputPanel_AddPaint(HWND hPanel, const std::wstring& path)
+{
+    PanelData* d = GetData(hPanel);
+    if (!d) return;
+
+    RECT rcPanel;
+    GetClientRect(hPanel, &rcPanel);
+    int panelW = std::max((int)rcPanel.right, 100);
+
+    // 画像サイズを先に取得して高さを確定
+    Gdiplus::Image* pImg = Gdiplus::Image::FromFile(path.c_str());
+    if (pImg && pImg->GetLastStatus() != Gdiplus::Ok) { delete pImg; pImg = nullptr; }
+
+    int height = 400;
+    if (pImg) {
+        UINT iw = pImg->GetWidth();
+        UINT ih = pImg->GetHeight();
+        if (iw > 0 && ih > 0) {
+            height = (int)((float)ih / iw * panelW);
+            height = std::max(50, std::min(height, 600));
+        }
+    }
+
+    FinalizeActiveConsole(hPanel);
+
+    int yPos = d->totalHeight - d->scrollOffset;
+    HWND hPaint = CreateWindowEx(
+        WS_EX_CLIENTEDGE, PAINT_CTRL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE,
+        0, yPos, panelW, height,
+        hPanel, nullptr, d->hInst, nullptr);
+
+    // 画像を PaintCtrl の memory DC に描画
+    auto* pd = (PaintCtrlData*)GetWindowLongPtr(hPaint, GWLP_USERDATA);
+    if (pd && pImg) {
+        Gdiplus::Graphics g(pd->hMemDC);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(pImg, 0, 0, pd->bmWidth, pd->bmHeight);
+        InvalidateRect(hPaint, nullptr, FALSE);
+    }
+    delete pImg;
+
+    d->items.push_back({ OutputType::Paint, hPaint, height });
     LayoutPanel(hPanel);
 }
 
