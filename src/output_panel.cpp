@@ -762,7 +762,7 @@ void OutputPanel_AddFileList(HWND hPanel, const std::wstring& dirPath)
 
     int idx = 0;
     do {
-        if (wcscmp(ffd.cFileName, L".") == 0) continue;
+        if (wcscmp(ffd.cFileName, L".") == 0 || wcscmp(ffd.cFileName, L"..") == 0) continue;
 
         std::wstring fp = std::wstring(fullPath) + L"\\" + ffd.cFileName;
         SHFILEINFO fi   = {};
