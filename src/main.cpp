@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <gdiplus.h>
+#include <shlobj.h>
 #include <vector>
 #include <string>
 #include "vizcommand.h"
@@ -34,10 +35,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         // 出力パネル (ウィンドウ全体)
         g_hOutputPanel = OutputPanel_Create(hwnd, g_hInst, 0, 0, w, h);
 
-        // カレントディレクトリ初期化
-        wchar_t cwd[MAX_PATH];
-        GetCurrentDirectory(MAX_PATH, cwd);
-        g_currentDir = cwd;
+        // カレントディレクトリ初期化 (ドキュメントフォルダをデフォルトに)
+        {
+            PWSTR docs = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+                g_currentDir = docs;
+                CoTaskMemFree(docs);
+            } else {
+                wchar_t cwd[MAX_PATH];
+                GetCurrentDirectory(MAX_PATH, cwd);
+                g_currentDir = cwd;
+            }
+        }
 
         // 起動メッセージ
         OutputPanel_AddText(g_hOutputPanel,
