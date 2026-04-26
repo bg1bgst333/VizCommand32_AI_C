@@ -8,8 +8,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <fstream>
-#include <sstream>
+#include <cstdint>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
@@ -220,15 +219,163 @@ struct ConsoleCtrlData {
 static std::vector<std::wstring> g_cmdHistory;
 static int g_historyIdx = 0;
 
-// \n → \r\n 正規化
+// ================================================================
+// テキストファイル読み込み (文字コード自動判別)
+// ================================================================
+
+// UTF-8 らしさスコア
+static int ScoreUTF8(const std::vector<uint8_t>& d)
+{
+    int score = 0;
+    for (size_t i = 0; i < d.size(); ) {
+        uint8_t b = d[i];
+        if (b < 0x80) { i++; continue; }
+        int extra = 0;
+        if      ((b & 0xE0) == 0xC0) extra = 1;
+        else if ((b & 0xF0) == 0xE0) extra = 2;
+        else if ((b & 0xF8) == 0xF0) extra = 3;
+        else { score -= 2; i++; continue; }
+        bool ok = true;
+        for (int j = 1; j <= extra && i + j < d.size(); j++)
+            if ((d[i + j] & 0xC0) != 0x80) { ok = false; break; }
+        if (ok) { score += extra * 2; i += extra + 1; }
+        else    { score -= 2; i++; }
+    }
+    return score;
+}
+
+// EUC-JP らしさスコア
+static int ScoreEUCJP(const std::vector<uint8_t>& d)
+{
+    int score = 0;
+    for (size_t i = 0; i < d.size(); ) {
+        uint8_t b = d[i];
+        if (b < 0x80) { i++; continue; }
+        if ((b >= 0xA1 && b <= 0xFE) && i + 1 < d.size()) {
+            uint8_t b2 = d[i + 1];
+            if (b2 >= 0xA1 && b2 <= 0xFE) { score += 2; i += 2; continue; }
+        }
+        if (b == 0x8E && i + 1 < d.size()) {
+            uint8_t b2 = d[i + 1];
+            if (b2 >= 0xA1 && b2 <= 0xDF) { score += 2; i += 2; continue; }
+        }
+        score -= 2; i++;
+    }
+    return score;
+}
+
+// Shift-JIS らしさスコア
+static int ScoreSJIS(const std::vector<uint8_t>& d)
+{
+    int score = 0;
+    for (size_t i = 0; i < d.size(); ) {
+        uint8_t b = d[i];
+        if (b < 0x80) { i++; continue; }
+        if (((b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC)) && i + 1 < d.size()) {
+            uint8_t b2 = d[i + 1];
+            if ((b2 >= 0x40 && b2 <= 0x7E) || (b2 >= 0x80 && b2 <= 0xFC)) {
+                score += 2; i += 2; continue;
+            }
+        }
+        if (b >= 0xA1 && b <= 0xDF) { score += 1; i++; continue; } // 半角カナ
+        score -= 2; i++;
+    }
+    return score;
+}
+
+// ファイルを読み込み wstring に変換 (BOM/ヒューリスティックで文字コード判別)
+static std::wstring ReadTextFileAsWString(const std::wstring& path)
+{
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    std::vector<uint8_t> data(fileSize);
+    DWORD readBytes = 0;
+    ReadFile(hFile, data.data(), fileSize, &readBytes, nullptr);
+    CloseHandle(hFile);
+    data.resize(readBytes);
+    if (data.empty()) return L"";
+
+    size_t offset  = 0;
+    UINT   cp      = 0;
+    bool   utf16le = false, utf16be = false;
+
+    // BOM 判定
+    if (data.size() >= 2 && data[0] == 0xFF && data[1] == 0xFE)
+        { utf16le = true; offset = 2; }
+    else if (data.size() >= 2 && data[0] == 0xFE && data[1] == 0xFF)
+        { utf16be = true; offset = 2; }
+    else if (data.size() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF)
+        { cp = CP_UTF8; offset = 3; }
+
+    // UTF-16 LE
+    if (utf16le) {
+        const wchar_t* p = reinterpret_cast<const wchar_t*>(data.data() + offset);
+        return std::wstring(p, (data.size() - offset) / 2);
+    }
+
+    // UTF-16 BE (バイトスワップ)
+    if (utf16be) {
+        size_t len = (data.size() - offset) / 2;
+        std::wstring ws(len, 0);
+        for (size_t i = 0; i < len; i++)
+            ws[i] = (wchar_t)((data[offset + i*2] << 8) | data[offset + i*2 + 1]);
+        return ws;
+    }
+
+    // JIS 判定 (ESC シーケンス)
+    if (cp == 0) {
+        for (size_t i = 0; i + 2 < data.size(); i++) {
+            if (data[i] == 0x1B) {
+                if ((data[i+1] == '$' && (data[i+2] == 'B' || data[i+2] == '@')) ||
+                    (data[i+1] == '(' && (data[i+2] == 'J' || data[i+2] == 'B')))
+                { cp = 50220; break; } // ISO-2022-JP
+            }
+        }
+    }
+
+    // ヒューリスティック
+    if (cp == 0) {
+        bool allAscii = true;
+        for (auto b : data) if (b >= 0x80) { allAscii = false; break; }
+        if (allAscii) {
+            cp = CP_UTF8;
+        } else {
+            int su = ScoreUTF8(data);
+            int se = ScoreEUCJP(data);
+            int ss = ScoreSJIS(data);
+            if (su >= se && su >= ss)      cp = CP_UTF8;
+            else if (se >= ss)             cp = 20932; // EUC-JP
+            else                           cp = 932;   // Shift-JIS
+        }
+    }
+
+    // MultiByteToWideChar で変換
+    const char* src    = reinterpret_cast<const char*>(data.data() + offset);
+    int         srcLen = (int)(data.size() - offset);
+    int wlen = MultiByteToWideChar(cp, 0, src, srcLen, nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring ws(wlen, 0);
+    MultiByteToWideChar(cp, 0, src, srcLen, &ws[0], wlen);
+    return ws;
+}
+
+// CR/CRLF/LF → \r\n 正規化
 static std::wstring NormalizeNewlines(const std::wstring& s)
 {
     std::wstring r;
     r.reserve(s.size() * 2);
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == L'\n' && (i == 0 || s[i-1] != L'\r'))
-            r += L'\r';
-        r += s[i];
+        if (s[i] == L'\r') {
+            r += L'\r'; r += L'\n';
+            if (i + 1 < s.size() && s[i + 1] == L'\n') ++i; // CRLF → skip \n
+        } else if (s[i] == L'\n') {
+            r += L'\r'; r += L'\n';
+        } else {
+            r += s[i];
+        }
     }
     return r;
 }
@@ -808,17 +955,12 @@ void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    std::wstring content;
-    std::wifstream fs(filePath);
-    if (fs) {
-        fs.imbue(std::locale(""));
-        std::wstringstream ss;
-        ss << fs.rdbuf();
-        content = ss.str();
-    } else {
+    std::wstring content = ReadTextFileAsWString(filePath);
+    if (content.empty() && GetFileAttributesW(filePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
         return;
     }
+    content = NormalizeNewlines(content);
 
     FinalizeActiveConsole(hPanel);
 
@@ -848,17 +990,12 @@ void OutputPanel_AddTextView(HWND hPanel, const std::wstring& filePath)
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    std::wstring content;
-    std::wifstream fs(filePath);
-    if (fs) {
-        fs.imbue(std::locale(""));
-        std::wstringstream ss;
-        ss << fs.rdbuf();
-        content = NormalizeNewlines(ss.str());
-    } else {
+    std::wstring content = ReadTextFileAsWString(filePath);
+    if (content.empty() && GetFileAttributesW(filePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
         return;
     }
+    content = NormalizeNewlines(content);
 
     FinalizeActiveConsole(hPanel);
 
