@@ -56,7 +56,7 @@ static LRESULT CALLBACK ImageCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             int drawW = (int)(imgW * scale);
             int drawH = (int)(imgH * scale);
             int drawX = (ctrlW - drawW) / 2;
-            int drawY = (ctrlH - drawH) / 2;
+            int drawY = 0;
 
             g.DrawImage(d->pImage, drawX, drawY, drawW, drawH);
         } else {
