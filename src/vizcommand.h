@@ -24,6 +24,20 @@ enum class OutputType {
     Paint,      // 画像編集 (ペイントツール)
 };
 
+// テキスト文字コード
+enum class TextEncoding {
+    UTF8,       // UTF-8 (BOMなし)
+    UTF8_BOM,   // UTF-8 (BOM付き)
+    UTF16LE,    // UTF-16 LE
+    UTF16BE,    // UTF-16 BE
+    ShiftJIS,   // Shift-JIS
+    EUCJP,      // EUC-JP
+    JIS,        // JIS (ISO-2022-JP)
+};
+
+// テキスト改行コード
+enum class LineEnding { CRLF, LF, CR };
+
 // ウィンドウリストビューの各エントリ
 struct OutputItem {
     OutputType  type;

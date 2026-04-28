@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <gdiplus.h>
+#include <commdlg.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -13,6 +14,10 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
+
+// EditPanel → OutputPanel 編集終了通知
+#define WM_APP_EDIT_DONE  (WM_APP + 1)
 
 // ================================================================
 // ImageCtrl  GDI+ 画像表示カスタムコントロール
@@ -203,6 +208,220 @@ static void RegisterPaintCtrl(HINSTANCE hInst)
     RegisterClassEx(&wc);
 }
 
+// 前方宣言
+static bool SaveTextFile(const std::wstring& path, HWND hEdit, TextEncoding enc, LineEnding le);
+
+// ================================================================
+// EditPanel  テキストファイル編集 (ツールバー付きモーダルエディタ)
+// ================================================================
+#define EDIT_PANEL_CLASS  L"VizCmdEditPanel"
+#define EDIT_TOOLBAR_H    32
+
+#define IDC_EP_SAVE    1001
+#define IDC_EP_SAVEAS  1002
+#define IDC_EP_DISCARD 1003
+#define IDC_EP_ENC     1004
+#define IDC_EP_LINEEND 1005
+
+struct EditPanelData {
+    HWND         hEdit;
+    HWND         hBtnSave;
+    HWND         hBtnSaveAs;
+    HWND         hBtnDiscard;
+    HWND         hCmbEnc;
+    HWND         hCmbEnd;
+    HFONT        hEditFont;
+    HFONT        hUiFont;
+    std::wstring filePath;
+};
+
+static const wchar_t* kEncNames[] = {
+    L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE",
+    L"Shift-JIS", L"EUC-JP", L"JIS (ISO-2022-JP)"
+};
+static const TextEncoding kEncodings[] = {
+    TextEncoding::UTF8, TextEncoding::UTF8_BOM,
+    TextEncoding::UTF16LE, TextEncoding::UTF16BE,
+    TextEncoding::ShiftJIS, TextEncoding::EUCJP, TextEncoding::JIS
+};
+static const int kEncCount = 7;
+
+static const wchar_t* kLineEndNames[] = { L"CRLF", L"LF", L"CR" };
+static const LineEnding kLineEndings[] = { LineEnding::CRLF, LineEnding::LF, LineEnding::CR };
+static const int kLineEndCount = 3;
+
+static int EncodingToIndex(TextEncoding enc) {
+    for (int i = 0; i < kEncCount; i++) if (kEncodings[i] == enc) return i;
+    return 0;
+}
+
+static void EP_LayoutControls(HWND hwnd)
+{
+    auto* d = (EditPanelData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (!d) return;
+
+    RECT rc; GetClientRect(hwnd, &rc);
+    int W = rc.right;
+    int H = rc.bottom;
+
+    // ツールバー: 左側にボタン、右側にコンボ
+    int y = 4, btnH = 24;
+    int x = 4;
+    MoveWindow(d->hBtnSave,    x, y,  90, btnH, TRUE); x += 94;
+    MoveWindow(d->hBtnSaveAs,  x, y, 130, btnH, TRUE); x += 134;
+    MoveWindow(d->hBtnDiscard, x, y,  60, btnH, TRUE);
+
+    // コンボボックスは右寄せ
+    int rx = W - 4;
+    int cmbEndW = 70; rx -= cmbEndW;
+    MoveWindow(d->hCmbEnd, rx, y, cmbEndW, 200, TRUE); rx -= 6;
+    int cmbEncW = 130; rx -= cmbEncW;
+    MoveWindow(d->hCmbEnc, rx, y, cmbEncW, 200, TRUE);
+
+    // EDIT 本体
+    MoveWindow(d->hEdit, 0, EDIT_TOOLBAR_H, W, std::max(H - EDIT_TOOLBAR_H, 50), TRUE);
+}
+
+static LRESULT CALLBACK EditPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* d = (EditPanelData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs   = (CREATESTRUCT*)lParam;
+        auto* data = new EditPanelData{};
+
+        data->hEditFont = CreateFont(
+            16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        data->hUiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+        auto mkBtn = [&](LPCWSTR text, int id) -> HWND {
+            return CreateWindowEx(0, L"BUTTON", text,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)id, cs->hInstance, nullptr);
+        };
+        data->hBtnSave    = mkBtn(L"上書き保存",       IDC_EP_SAVE);
+        data->hBtnSaveAs  = mkBtn(L"名前を付けて保存",  IDC_EP_SAVEAS);
+        data->hBtnDiscard = mkBtn(L"破棄",             IDC_EP_DISCARD);
+        SendMessage(data->hBtnSave,    WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+        SendMessage(data->hBtnSaveAs,  WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+        SendMessage(data->hBtnDiscard, WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+
+        data->hCmbEnc = CreateWindowEx(0, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 10, 200, hwnd, (HMENU)(INT_PTR)IDC_EP_ENC, cs->hInstance, nullptr);
+        SendMessage(data->hCmbEnc, WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+        for (int i = 0; i < kEncCount; i++)
+            SendMessage(data->hCmbEnc, CB_ADDSTRING, 0, (LPARAM)kEncNames[i]);
+
+        data->hCmbEnd = CreateWindowEx(0, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, 0, 10, 200, hwnd, (HMENU)(INT_PTR)IDC_EP_LINEEND, cs->hInstance, nullptr);
+        SendMessage(data->hCmbEnd, WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+        for (int i = 0; i < kLineEndCount; i++)
+            SendMessage(data->hCmbEnd, CB_ADDSTRING, 0, (LPARAM)kLineEndNames[i]);
+
+        data->hEdit = CreateWindowEx(
+            WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+            0, EDIT_TOOLBAR_H, 10, 10,
+            hwnd, nullptr, cs->hInstance, nullptr);
+        SendMessage(data->hEdit, WM_SETFONT, (WPARAM)data->hEditFont, FALSE);
+        SendMessage(data->hEdit, EM_SETLIMITTEXT, 10 * 1024 * 1024, 0);
+
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        break;
+    }
+
+    case WM_SIZE:
+        EP_LayoutControls(hwnd);
+        break;
+
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc; GetClientRect(hwnd, &rc);
+        rc.bottom = EDIT_TOOLBAR_H;
+        FillRect(hdc, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
+        // セパレータライン
+        RECT line = { 0, EDIT_TOOLBAR_H - 1, rc.right, EDIT_TOOLBAR_H };
+        FillRect(hdc, &line, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        return 1;
+    }
+
+    case WM_COMMAND: {
+        if (!d) break;
+        int id = LOWORD(wParam);
+
+        if (id == IDC_EP_SAVE || id == IDC_EP_SAVEAS) {
+            int encIdx = (int)SendMessage(d->hCmbEnc, CB_GETCURSEL, 0, 0);
+            int leIdx  = (int)SendMessage(d->hCmbEnd, CB_GETCURSEL, 0, 0);
+            TextEncoding enc = (encIdx >= 0 && encIdx < kEncCount)    ? kEncodings[encIdx]   : TextEncoding::UTF8;
+            LineEnding   le  = (leIdx  >= 0 && leIdx  < kLineEndCount) ? kLineEndings[leIdx]  : LineEnding::CRLF;
+
+            std::wstring savePath = d->filePath;
+
+            if (id == IDC_EP_SAVEAS) {
+                wchar_t szFile[MAX_PATH] = {};
+                if (!d->filePath.empty())
+                    wcsncpy_s(szFile, d->filePath.c_str(), MAX_PATH - 1);
+                OPENFILENAMEW ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner   = hwnd;
+                ofn.lpstrFile   = szFile;
+                ofn.nMaxFile    = MAX_PATH;
+                ofn.lpstrFilter = L"テキストファイル\0*.txt;*.log;*.csv\0すべてのファイル\0*.*\0";
+                ofn.Flags       = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+                if (!GetSaveFileNameW(&ofn)) break; // キャンセル
+                savePath = szFile;
+            }
+
+            if (!SaveTextFile(savePath, d->hEdit, enc, le)) {
+                MessageBoxW(hwnd,
+                    (L"保存に失敗しました:\n" + savePath).c_str(),
+                    L"エラー", MB_ICONERROR | MB_OK);
+                break;
+            }
+            d->filePath = savePath;
+            SendMessage(d->hEdit, EM_SETMODIFY, FALSE, 0);
+            PostMessage(GetParent(hwnd), WM_APP_EDIT_DONE, 0, (LPARAM)hwnd);
+        }
+        else if (id == IDC_EP_DISCARD) {
+            if (SendMessage(d->hEdit, EM_GETMODIFY, 0, 0)) {
+                int ret = MessageBoxW(hwnd,
+                    L"変更を破棄しますか？\n保存されていない変更は失われます。",
+                    L"確認", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2);
+                if (ret != IDYES) break;
+            }
+            PostMessage(GetParent(hwnd), WM_APP_EDIT_DONE, 0, (LPARAM)hwnd);
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (d) {
+            if (d->hEditFont) DeleteObject(d->hEditFont);
+            // hUiFont は GetStockObject なので DeleteObject 不要
+            delete d;
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterEditPanel(HINSTANCE hInst)
+{
+    WNDCLASSEX wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = EditPanelProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = EDIT_PANEL_CLASS;
+    RegisterClassEx(&wc);
+}
+
 // ================================================================
 // ConsoleCtrl  テキスト入出力共用コンソール EDIT
 // ================================================================
@@ -220,7 +439,7 @@ static std::vector<std::wstring> g_cmdHistory;
 static int g_historyIdx = 0;
 
 // ================================================================
-// テキストファイル読み込み (文字コード自動判別)
+// テキストファイル読み込み / 保存 (文字コード自動判別)
 // ================================================================
 
 // UTF-8 らしさスコア
@@ -283,12 +502,38 @@ static int ScoreSJIS(const std::vector<uint8_t>& d)
     return score;
 }
 
-// ファイルを読み込み wstring に変換 (BOM/ヒューリスティックで文字コード判別)
-static std::wstring ReadTextFileAsWString(const std::wstring& path)
+// 改行コード検出 (wstring から)
+static LineEnding DetectLineEndingWStr(const std::wstring& ws)
 {
+    bool hasCRLF = false, hasCR = false, hasLF = false;
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (ws[i] == L'\r') {
+            if (i + 1 < ws.size() && ws[i+1] == L'\n') { hasCRLF = true; i++; }
+            else hasCR = true;
+        } else if (ws[i] == L'\n') {
+            hasLF = true;
+        }
+    }
+    if (hasCRLF) return LineEnding::CRLF;
+    if (hasLF)   return LineEnding::LF;
+    if (hasCR)   return LineEnding::CR;
+    return LineEnding::CRLF;
+}
+
+struct TextFileInfo {
+    std::wstring content;
+    TextEncoding encoding   = TextEncoding::UTF8;
+    LineEnding   lineEnding = LineEnding::CRLF;
+};
+
+// ファイルを読み込み (BOM/ヒューリスティックで文字コード判別、改行コードも検出)
+static TextFileInfo ReadTextFile(const std::wstring& path)
+{
+    TextFileInfo result;
+
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return L"";
+    if (hFile == INVALID_HANDLE_VALUE) return result;
 
     DWORD fileSize = GetFileSize(hFile, nullptr);
     std::vector<uint8_t> data(fileSize);
@@ -296,7 +541,7 @@ static std::wstring ReadTextFileAsWString(const std::wstring& path)
     ReadFile(hFile, data.data(), fileSize, &readBytes, nullptr);
     CloseHandle(hFile);
     data.resize(readBytes);
-    if (data.empty()) return L"";
+    if (data.empty()) return result;
 
     size_t offset  = 0;
     UINT   cp      = 0;
@@ -304,62 +549,137 @@ static std::wstring ReadTextFileAsWString(const std::wstring& path)
 
     // BOM 判定
     if (data.size() >= 2 && data[0] == 0xFF && data[1] == 0xFE)
-        { utf16le = true; offset = 2; }
+        { utf16le = true; offset = 2; result.encoding = TextEncoding::UTF16LE; }
     else if (data.size() >= 2 && data[0] == 0xFE && data[1] == 0xFF)
-        { utf16be = true; offset = 2; }
+        { utf16be = true; offset = 2; result.encoding = TextEncoding::UTF16BE; }
     else if (data.size() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF)
-        { cp = CP_UTF8; offset = 3; }
+        { cp = CP_UTF8; offset = 3; result.encoding = TextEncoding::UTF8_BOM; }
 
     // UTF-16 LE
     if (utf16le) {
         const wchar_t* p = reinterpret_cast<const wchar_t*>(data.data() + offset);
-        return std::wstring(p, (data.size() - offset) / 2);
+        result.content = std::wstring(p, (data.size() - offset) / 2);
     }
-
     // UTF-16 BE (バイトスワップ)
-    if (utf16be) {
+    else if (utf16be) {
         size_t len = (data.size() - offset) / 2;
-        std::wstring ws(len, 0);
+        result.content.resize(len);
         for (size_t i = 0; i < len; i++)
-            ws[i] = (wchar_t)((data[offset + i*2] << 8) | data[offset + i*2 + 1]);
-        return ws;
+            result.content[i] = (wchar_t)((data[offset + i*2] << 8) | data[offset + i*2 + 1]);
     }
-
-    // JIS 判定 (ESC シーケンス)
-    if (cp == 0) {
-        for (size_t i = 0; i + 2 < data.size(); i++) {
-            if (data[i] == 0x1B) {
-                if ((data[i+1] == '$' && (data[i+2] == 'B' || data[i+2] == '@')) ||
-                    (data[i+1] == '(' && (data[i+2] == 'J' || data[i+2] == 'B')))
-                { cp = 50220; break; } // ISO-2022-JP
+    else {
+        // JIS 判定 (ESC シーケンス)
+        if (cp == 0) {
+            for (size_t i = 0; i + 2 < data.size(); i++) {
+                if (data[i] == 0x1B) {
+                    if ((data[i+1] == '$' && (data[i+2] == 'B' || data[i+2] == '@')) ||
+                        (data[i+1] == '(' && (data[i+2] == 'J' || data[i+2] == 'B')))
+                    { cp = 50220; result.encoding = TextEncoding::JIS; break; }
+                }
             }
         }
-    }
 
-    // ヒューリスティック
-    if (cp == 0) {
-        bool allAscii = true;
-        for (auto b : data) if (b >= 0x80) { allAscii = false; break; }
-        if (allAscii) {
-            cp = CP_UTF8;
-        } else {
-            int su = ScoreUTF8(data);
-            int se = ScoreEUCJP(data);
-            int ss = ScoreSJIS(data);
-            if (su >= se && su >= ss)      cp = CP_UTF8;
-            else if (se >= ss)             cp = 20932; // EUC-JP
-            else                           cp = 932;   // Shift-JIS
+        // ヒューリスティック
+        if (cp == 0) {
+            bool allAscii = true;
+            for (auto b : data) if (b >= 0x80) { allAscii = false; break; }
+            if (allAscii) {
+                cp = CP_UTF8; result.encoding = TextEncoding::UTF8;
+            } else {
+                int su = ScoreUTF8(data);
+                int se = ScoreEUCJP(data);
+                int ss = ScoreSJIS(data);
+                if (su >= se && su >= ss)  { cp = CP_UTF8; result.encoding = TextEncoding::UTF8;     }
+                else if (se >= ss)         { cp = 20932;   result.encoding = TextEncoding::EUCJP;    }
+                else                       { cp = 932;     result.encoding = TextEncoding::ShiftJIS; }
+            }
+        }
+
+        // MultiByteToWideChar で変換
+        const char* src    = reinterpret_cast<const char*>(data.data() + offset);
+        int         srcLen = (int)(data.size() - offset);
+        int wlen = MultiByteToWideChar(cp, 0, src, srcLen, nullptr, 0);
+        if (wlen > 0) {
+            result.content.resize(wlen);
+            MultiByteToWideChar(cp, 0, src, srcLen, &result.content[0], wlen);
         }
     }
 
-    // MultiByteToWideChar で変換
-    const char* src    = reinterpret_cast<const char*>(data.data() + offset);
-    int         srcLen = (int)(data.size() - offset);
-    int wlen = MultiByteToWideChar(cp, 0, src, srcLen, nullptr, 0);
-    if (wlen <= 0) return L"";
-    std::wstring ws(wlen, 0);
-    MultiByteToWideChar(cp, 0, src, srcLen, &ws[0], wlen);
-    return ws;
+    result.lineEnding = DetectLineEndingWStr(result.content);
+    return result;
+}
+
+static std::wstring ReadTextFileAsWString(const std::wstring& path)
+{
+    return ReadTextFile(path).content;
+}
+
+// ファイルへの保存 (文字コード・改行コード指定)
+static bool SaveTextFile(const std::wstring& path, HWND hEdit,
+                         TextEncoding enc, LineEnding le)
+{
+    int len = GetWindowTextLengthW(hEdit);
+    std::wstring ws(len + 1, L'\0');
+    GetWindowTextW(hEdit, &ws[0], len + 1);
+    ws.resize(len);
+
+    // 改行コード変換 (EDIT 内は常に \r\n)
+    std::wstring converted;
+    converted.reserve(ws.size());
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (ws[i] == L'\r' && i + 1 < ws.size() && ws[i+1] == L'\n') {
+            switch (le) {
+            case LineEnding::CRLF: converted += L'\r'; converted += L'\n'; break;
+            case LineEnding::LF:   converted += L'\n'; break;
+            case LineEnding::CR:   converted += L'\r'; break;
+            }
+            i++; // \n をスキップ
+        } else {
+            converted += ws[i];
+        }
+    }
+
+    std::vector<uint8_t> bytes;
+    if (enc == TextEncoding::UTF16LE) {
+        bytes = { 0xFF, 0xFE };
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(converted.c_str());
+        bytes.insert(bytes.end(), p, p + converted.size() * 2);
+    } else if (enc == TextEncoding::UTF16BE) {
+        bytes = { 0xFE, 0xFF };
+        for (wchar_t c : converted) {
+            bytes.push_back((uint8_t)(c >> 8));
+            bytes.push_back((uint8_t)(c & 0xFF));
+        }
+    } else {
+        UINT cp;
+        bool addBOM = (enc == TextEncoding::UTF8_BOM);
+        switch (enc) {
+        case TextEncoding::UTF8_BOM: // fall through
+        case TextEncoding::UTF8:     cp = CP_UTF8; break;
+        case TextEncoding::ShiftJIS: cp = 932;     break;
+        case TextEncoding::EUCJP:    cp = 20932;   break;
+        case TextEncoding::JIS:      cp = 50220;   break;
+        default:                     cp = CP_UTF8; break;
+        }
+        if (addBOM) bytes = { 0xEF, 0xBB, 0xBF };
+
+        int mbLen = WideCharToMultiByte(cp, 0, converted.c_str(), (int)converted.size(),
+                                        nullptr, 0, nullptr, nullptr);
+        if (mbLen > 0) {
+            size_t off = bytes.size();
+            bytes.resize(off + mbLen);
+            WideCharToMultiByte(cp, 0, converted.c_str(), (int)converted.size(),
+                               (char*)bytes.data() + off, mbLen, nullptr, nullptr);
+        }
+    }
+
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    WriteFile(hFile, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
+    CloseHandle(hFile);
+    return written == (DWORD)bytes.size();
 }
 
 // CR/CRLF/LF → \r\n 正規化
@@ -723,6 +1043,30 @@ static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         return 1;
     }
 
+    case WM_APP_EDIT_DONE: {
+        // EditPanel から編集終了通知を受け取る
+        // パネルは破棄せず操作類を無効化・読み取り専用にして残す
+        HWND hEP = (HWND)lParam;
+        bool found = false;
+        for (auto& item : d->items)
+            if (item.hwnd == hEP) { found = true; break; }
+
+        if (found) {
+            auto* epd = (EditPanelData*)GetWindowLongPtr(hEP, GWLP_USERDATA);
+            if (epd) {
+                EnableWindow(epd->hBtnSave,    FALSE);
+                EnableWindow(epd->hBtnSaveAs,  FALSE);
+                EnableWindow(epd->hBtnDiscard, FALSE);
+                EnableWindow(epd->hCmbEnc,     FALSE);
+                EnableWindow(epd->hCmbEnd,     FALSE);
+                SendMessage(epd->hEdit, EM_SETREADONLY, TRUE, 0);
+            }
+            OutputPanel_AddPrompt(hwnd);
+            OutputPanel_ScrollToBottom(hwnd);
+        }
+        break;
+    }
+
     case WM_DESTROY:
         if (d) { if (d->hFont) DeleteObject(d->hFont); delete d; }
         break;
@@ -833,6 +1177,7 @@ void OutputPanel_Register(HINSTANCE hInst)
 {
     RegisterImageCtrl(hInst);
     RegisterPaintCtrl(hInst);
+    RegisterEditPanel(hInst);
     RegisterConsoleCtrl(hInst);
 
     WNDCLASSEX wc = {};
@@ -949,38 +1294,53 @@ void OutputPanel_AddImage(HWND hPanel, const std::wstring& path)
     LayoutPanel(hPanel);
 }
 
-// ---- テキストエディタ --------------------------------------------
+// ---- テキストエディタ (EditPanel) --------------------------------
 void OutputPanel_AddEdit(HWND hPanel, const std::wstring& filePath)
 {
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    std::wstring content = ReadTextFileAsWString(filePath);
-    if (content.empty() && GetFileAttributesW(filePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
-        return;
+    TextFileInfo info;
+    if (!filePath.empty()) {
+        info = ReadTextFile(filePath);
+        if (info.content.empty() && GetFileAttributesW(filePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            OutputPanel_AddText(hPanel, L"Error: cannot open file: " + filePath);
+            return;
+        }
     }
-    content = NormalizeNewlines(content);
+    std::wstring content = NormalizeNewlines(info.content);
 
     FinalizeActiveConsole(hPanel);
 
     RECT rcPanel;
     GetClientRect(hPanel, &rcPanel);
     int panelW = std::max((int)rcPanel.right, 200);
-    int editH  = 280;
+    int panelH = std::max((int)rcPanel.bottom, 300);
     int yPos   = d->totalHeight - d->scrollOffset;
 
-    HWND hEdit = CreateWindowEx(
-        WS_EX_CLIENTEDGE, L"EDIT", content.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL
-            | WS_VSCROLL | WS_HSCROLL,
-        0, yPos, panelW, editH,
+    HWND hEP = CreateWindowEx(
+        0, EDIT_PANEL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, yPos, panelW, panelH,
         hPanel, nullptr, d->hInst, nullptr);
 
-    if (d->hFont) SendMessage(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-    SetProp(hEdit, L"FilePath", (HANDLE)new std::wstring(filePath));
+    auto* epd = (EditPanelData*)GetWindowLongPtr(hEP, GWLP_USERDATA);
+    if (epd) {
+        epd->filePath = filePath;
+        SetWindowTextW(epd->hEdit, content.c_str());
+        SendMessage(epd->hEdit, EM_SETMODIFY, FALSE, 0);
+        SendMessage(epd->hCmbEnc, CB_SETCURSEL, EncodingToIndex(info.encoding), 0);
+        int leIdx = 0;
+        for (int i = 0; i < kLineEndCount; i++) {
+            if (kLineEndings[i] == info.lineEnding) { leIdx = i; break; }
+        }
+        SendMessage(epd->hCmbEnd, CB_SETCURSEL, leIdx, 0);
+        // ファイルパスなし (新規作成) は上書き保存を無効化
+        EnableWindow(epd->hBtnSave, !filePath.empty());
+        SetFocus(epd->hEdit);
+    }
 
-    d->items.push_back({ OutputType::Edit, hEdit, editH });
+    d->items.push_back({ OutputType::Edit, hEP, panelH });
     LayoutPanel(hPanel);
 }
 
@@ -1174,13 +1534,8 @@ void OutputPanel_Clear(HWND hPanel)
     PanelData* d = GetData(hPanel);
     if (!d) return;
 
-    for (auto& item : d->items) {
-        if (item.type == OutputType::Edit) {
-            auto* fp = (std::wstring*)GetProp(item.hwnd, L"FilePath");
-            if (fp) { delete fp; RemoveProp(item.hwnd, L"FilePath"); }
-        }
+    for (auto& item : d->items)
         DestroyWindow(item.hwnd);
-    }
     d->items.clear();
     d->totalHeight  = 0;
     d->scrollOffset = 0;
