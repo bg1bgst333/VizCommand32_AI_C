@@ -102,16 +102,18 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
                 OutputPanel_AddTextView(hOutputPanel, p);
         }
     }
-    // ---- edit <ファイル> -------------------------------------
+    // ---- edit [ファイル] -------------------------------------
     else if (cmd == L"edit") {
-        if (args.empty()) {
-            OutputPanel_AddText(hOutputPanel, L"使い方: edit <ファイルパス>");
+        if (!args.empty() && IsImageFile(ResolvePath(args))) {
+            OutputPanel_AddPaint(hOutputPanel, ResolvePath(args));
         } else {
-            std::wstring p = ResolvePath(args);
-            if (IsImageFile(p))
-                OutputPanel_AddPaint(hOutputPanel, p);
-            else
-                OutputPanel_AddEdit(hOutputPanel, p);
+            // 引数なし → 新規作成、あり → 既存ファイル編集
+            // テキスト編集中はプロンプトを出さない
+            // 編集終了後に EditPanel が WM_APP_EDIT_DONE で AddPrompt を呼ぶ
+            std::wstring p = args.empty() ? L"" : ResolvePath(args);
+            OutputPanel_AddEdit(hOutputPanel, p);
+            OutputPanel_ScrollToBottom(hOutputPanel);
+            return;
         }
     }
     // ---- clear / cls -----------------------------------------
