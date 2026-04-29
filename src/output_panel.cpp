@@ -16,8 +16,9 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 
-// EditPanel → OutputPanel 編集終了通知
-#define WM_APP_EDIT_DONE  (WM_APP + 1)
+// EditPanel / ImageEditPanel → OutputPanel 編集終了通知
+#define WM_APP_EDIT_DONE        (WM_APP + 1)
+#define WM_APP_IMAGE_EDIT_DONE  (WM_APP + 2)
 
 // ================================================================
 // ImageCtrl  GDI+ 画像表示カスタムコントロール
@@ -102,6 +103,7 @@ struct PaintCtrlData {
     HBITMAP  hBitmap;
     int      bmWidth, bmHeight;
     bool     painting;
+    bool     modified;
     POINT    lastPt;
     COLORREF penColor;
     int      penSize;
@@ -115,6 +117,7 @@ static LRESULT CALLBACK PaintCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_CREATE: {
         auto* data = new PaintCtrlData{};
         data->painting  = false;
+        data->modified  = false;
         data->penColor  = RGB(0, 0, 0);
         data->penSize   = 3;
 
@@ -144,6 +147,33 @@ static LRESULT CALLBACK PaintCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     }
 
+    case WM_SIZE: {
+        if (!d) break;
+        int newW = std::max((int)LOWORD(lParam), 1);
+        int newH = std::max((int)HIWORD(lParam), 1);
+        if (newW == d->bmWidth && newH == d->bmHeight) break;
+
+        HDC hdc = GetDC(hwnd);
+        HBITMAP hNewBmp = CreateCompatibleBitmap(hdc, newW, newH);
+        ReleaseDC(hwnd, hdc);
+
+        HDC hTmpDC = CreateCompatibleDC(nullptr);
+        HGDIOBJ hOldTmp = SelectObject(hTmpDC, hNewBmp);
+        RECT fill = { 0, 0, newW, newH };
+        FillRect(hTmpDC, &fill, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        BitBlt(hTmpDC, 0, 0, d->bmWidth, d->bmHeight, d->hMemDC, 0, 0, SRCCOPY);
+        SelectObject(hTmpDC, hOldTmp);
+        DeleteDC(hTmpDC);
+
+        SelectObject(d->hMemDC, hNewBmp);
+        DeleteObject(d->hBitmap);
+        d->hBitmap  = hNewBmp;
+        d->bmWidth  = newW;
+        d->bmHeight = newH;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    }
+
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             SetCursor(LoadCursor(nullptr, IDC_CROSS));
@@ -154,6 +184,7 @@ static LRESULT CALLBACK PaintCtrlProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     case WM_LBUTTONDOWN:
         if (d) {
             d->painting = true;
+            d->modified = true;
             d->lastPt   = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             HPEN hPen = CreatePen(PS_SOLID, d->penSize, d->penColor);
             HPEN hOld = (HPEN)SelectObject(d->hMemDC, hPen);
@@ -205,6 +236,326 @@ static void RegisterPaintCtrl(HINSTANCE hInst)
     wc.hInstance     = hInst;
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     wc.lpszClassName = PAINT_CTRL_CLASS;
+    RegisterClassEx(&wc);
+}
+
+// ================================================================
+// ImageEditPanel  画像編集 (ツールバー + PaintCtrl)
+// ================================================================
+#define IMAGE_PANEL_CLASS     L"VizCmdImageEditPanel"
+#define IMAGE_PANEL_TOOLBAR_H 34
+
+static const COLORREF kPaletteColors[] = {
+    RGB(0,   0,   0  ),  // 黒
+    RGB(255, 255, 255),  // 白
+    RGB(128, 128, 128),  // グレー
+    RGB(255, 0,   0  ),  // 赤
+    RGB(0,   128, 0  ),  // 緑
+    RGB(0,   0,   255),  // 青
+    RGB(255, 255, 0  ),  // 黄
+    RGB(255, 128, 0  ),  // オレンジ
+    RGB(128, 0,   0  ),  // 茶
+    RGB(128, 0,   128),  // 紫
+};
+static const int kPaletteCount = 10;
+
+#define IDC_IEP_SAVE       2001
+#define IDC_IEP_SAVEAS     2002
+#define IDC_IEP_DISCARD    2003
+#define IDC_IEP_SIZE_DOWN  2004
+#define IDC_IEP_SIZE_UP    2005
+
+#define IEP_SWATCH_X    308
+#define IEP_SWATCH_SIZE  20
+#define IEP_SWATCH_GAP    2
+
+struct ImageEditPanelData {
+    HWND         hPaint;
+    HWND         hBtnSave;
+    HWND         hBtnSaveAs;
+    HWND         hBtnDiscard;
+    HWND         hBtnSizeDown;
+    HWND         hBtnSizeUp;
+    HWND         hLabelSize;
+    HFONT        hUiFont;
+    std::wstring filePath;
+    int          penSize;
+    int          selectedColorIdx;
+};
+
+static bool GetEncoderClsid(const wchar_t* mimeType, CLSID* pClsid)
+{
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return false;
+    auto* pInfo = (Gdiplus::ImageCodecInfo*)malloc(size);
+    if (!pInfo) return false;
+    Gdiplus::GetImageEncoders(num, size, pInfo);
+    bool found = false;
+    for (UINT i = 0; i < num; i++) {
+        if (wcscmp(pInfo[i].MimeType, mimeType) == 0) {
+            *pClsid = pInfo[i].Clsid;
+            found = true;
+            break;
+        }
+    }
+    free(pInfo);
+    return found;
+}
+
+static bool SaveImageFile(const std::wstring& path, HDC hMemDC, int w, int h)
+{
+    std::wstring ext;
+    size_t pos = path.rfind(L'.');
+    if (pos != std::wstring::npos) {
+        ext = path.substr(pos + 1);
+        for (auto& c : ext) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+    }
+    const wchar_t* mimeType = L"image/png";
+    if (ext == L"jpg" || ext == L"jpeg") mimeType = L"image/jpeg";
+    else if (ext == L"bmp")              mimeType = L"image/bmp";
+
+    CLSID clsid;
+    if (!GetEncoderClsid(mimeType, &clsid)) return false;
+
+    // hMemDC のビットマップを別ビットマップにコピー (FromHBITMAP は非選択状態が必要)
+    HDC hTmpDC = CreateCompatibleDC(hMemDC);
+    HBITMAP hTmpBmp = CreateCompatibleBitmap(hMemDC, w, h);
+    HGDIOBJ hOld = SelectObject(hTmpDC, hTmpBmp);
+    BitBlt(hTmpDC, 0, 0, w, h, hMemDC, 0, 0, SRCCOPY);
+    SelectObject(hTmpDC, hOld);
+    DeleteDC(hTmpDC);
+
+    Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(hTmpBmp, nullptr);
+    bool ok = false;
+    if (bmp) {
+        ok = (bmp->Save(path.c_str(), &clsid, nullptr) == Gdiplus::Ok);
+        delete bmp;
+    }
+    DeleteObject(hTmpBmp);
+    return ok;
+}
+
+static void IEP_UpdatePenState(HWND hwnd)
+{
+    auto* d = (ImageEditPanelData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (!d) return;
+
+    wchar_t buf[8];
+    swprintf_s(buf, L"%d", d->penSize);
+    SetWindowTextW(d->hLabelSize, buf);
+
+    auto* pd = (PaintCtrlData*)GetWindowLongPtr(d->hPaint, GWLP_USERDATA);
+    if (pd) {
+        pd->penColor = kPaletteColors[d->selectedColorIdx];
+        pd->penSize  = d->penSize;
+    }
+
+    int swatchEnd = IEP_SWATCH_X + kPaletteCount * (IEP_SWATCH_SIZE + IEP_SWATCH_GAP);
+    RECT rc = { IEP_SWATCH_X - 4, 0, swatchEnd + 4, IMAGE_PANEL_TOOLBAR_H };
+    InvalidateRect(hwnd, &rc, TRUE);
+}
+
+static void IEP_Layout(HWND hwnd)
+{
+    auto* d = (ImageEditPanelData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (!d) return;
+    RECT rc; GetClientRect(hwnd, &rc);
+    int W = rc.right, H = rc.bottom;
+    int y = (IMAGE_PANEL_TOOLBAR_H - 24) / 2, btnH = 24;
+    int x = 4;
+    MoveWindow(d->hBtnSave,    x, y,  90, btnH, TRUE); x += 94;
+    MoveWindow(d->hBtnSaveAs,  x, y, 130, btnH, TRUE); x += 134;
+    MoveWindow(d->hBtnDiscard, x, y,  60, btnH, TRUE);
+
+    // ペンサイズコントロール (スウォッチの右)
+    x = IEP_SWATCH_X + kPaletteCount * (IEP_SWATCH_SIZE + IEP_SWATCH_GAP) + 8;
+    MoveWindow(d->hBtnSizeDown, x, y, 24, btnH, TRUE); x += 28;
+    MoveWindow(d->hLabelSize,   x, y, 30, btnH, TRUE); x += 34;
+    MoveWindow(d->hBtnSizeUp,   x, y, 24, btnH, TRUE);
+
+    MoveWindow(d->hPaint, 0, IMAGE_PANEL_TOOLBAR_H,
+               W, std::max(H - IMAGE_PANEL_TOOLBAR_H, 50), TRUE);
+}
+
+static LRESULT CALLBACK ImageEditPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* d = (ImageEditPanelData*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs   = (CREATESTRUCT*)lParam;
+        auto* data = new ImageEditPanelData{};
+        data->hUiFont          = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        data->penSize          = 3;
+        data->selectedColorIdx = 0;
+
+        auto mkBtn = [&](LPCWSTR text, int id) -> HWND {
+            return CreateWindowEx(0, L"BUTTON", text,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)id, cs->hInstance, nullptr);
+        };
+        data->hBtnSave     = mkBtn(L"上書き保存",       IDC_IEP_SAVE);
+        data->hBtnSaveAs   = mkBtn(L"名前を付けて保存",  IDC_IEP_SAVEAS);
+        data->hBtnDiscard  = mkBtn(L"破棄",             IDC_IEP_DISCARD);
+        data->hBtnSizeDown = mkBtn(L"－",               IDC_IEP_SIZE_DOWN);
+        data->hBtnSizeUp   = mkBtn(L"＋",               IDC_IEP_SIZE_UP);
+        data->hLabelSize   = CreateWindowEx(0, L"STATIC", L"3",
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+            0, 0, 10, 10, hwnd, nullptr, cs->hInstance, nullptr);
+
+        HWND buttons[] = { data->hBtnSave, data->hBtnSaveAs, data->hBtnDiscard,
+                           data->hBtnSizeDown, data->hBtnSizeUp, data->hLabelSize };
+        for (HWND h : buttons)
+            SendMessage(h, WM_SETFONT, (WPARAM)data->hUiFont, FALSE);
+
+        data->hPaint = CreateWindowEx(
+            WS_EX_CLIENTEDGE, PAINT_CTRL_CLASS, nullptr,
+            WS_CHILD | WS_VISIBLE,
+            0, IMAGE_PANEL_TOOLBAR_H, 10, 10,
+            hwnd, nullptr, cs->hInstance, nullptr);
+
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        break;
+    }
+
+    case WM_SIZE:
+        if (d) IEP_Layout(hwnd);
+        break;
+
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT tbrc; GetClientRect(hwnd, &tbrc);
+        tbrc.bottom = IMAGE_PANEL_TOOLBAR_H;
+        FillRect(hdc, &tbrc, (HBRUSH)(COLOR_BTNFACE + 1));
+        RECT line = { 0, IMAGE_PANEL_TOOLBAR_H - 1, tbrc.right, IMAGE_PANEL_TOOLBAR_H };
+        FillRect(hdc, &line, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        return 1;
+    }
+
+    case WM_PAINT: {
+        if (!d) break;
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        int y0 = (IMAGE_PANEL_TOOLBAR_H - IEP_SWATCH_SIZE) / 2;
+        for (int i = 0; i < kPaletteCount; i++) {
+            int x0 = IEP_SWATCH_X + i * (IEP_SWATCH_SIZE + IEP_SWATCH_GAP);
+            RECT sr = { x0, y0, x0 + IEP_SWATCH_SIZE, y0 + IEP_SWATCH_SIZE };
+            HBRUSH hBr = CreateSolidBrush(kPaletteColors[i]);
+            FillRect(hdc, &sr, hBr);
+            DeleteObject(hBr);
+            // 選択枠
+            if (i == d->selectedColorIdx) {
+                HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
+                HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+                HBRUSH hOldBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, x0 - 2, y0 - 2,
+                          x0 + IEP_SWATCH_SIZE + 2, y0 + IEP_SWATCH_SIZE + 2);
+                SelectObject(hdc, hOld);
+                SelectObject(hdc, hOldBr);
+                DeleteObject(hPen);
+            }
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        if (!d) break;
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        int y0 = (IMAGE_PANEL_TOOLBAR_H - IEP_SWATCH_SIZE) / 2;
+        if (my >= y0 && my < y0 + IEP_SWATCH_SIZE) {
+            for (int i = 0; i < kPaletteCount; i++) {
+                int x0 = IEP_SWATCH_X + i * (IEP_SWATCH_SIZE + IEP_SWATCH_GAP);
+                if (mx >= x0 && mx < x0 + IEP_SWATCH_SIZE) {
+                    d->selectedColorIdx = i;
+                    IEP_UpdatePenState(hwnd);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    case WM_COMMAND: {
+        if (!d) break;
+        int id = LOWORD(wParam);
+
+        if (id == IDC_IEP_SIZE_DOWN) {
+            if (d->penSize > 1) { d->penSize--; IEP_UpdatePenState(hwnd); }
+        }
+        else if (id == IDC_IEP_SIZE_UP) {
+            if (d->penSize < 20) { d->penSize++; IEP_UpdatePenState(hwnd); }
+        }
+        else if (id == IDC_IEP_SAVE || id == IDC_IEP_SAVEAS) {
+            std::wstring savePath = d->filePath;
+            if (id == IDC_IEP_SAVEAS || savePath.empty()) {
+                wchar_t szFile[MAX_PATH] = {};
+                if (!d->filePath.empty())
+                    wcsncpy_s(szFile, d->filePath.c_str(), MAX_PATH - 1);
+                // 拡張子からデフォルトフィルタを決定 (1=PNG, 2=JPEG, 3=BMP, 4=全て)
+                DWORD filterIdx = 1;
+                {
+                    std::wstring ext;
+                    size_t dp = d->filePath.rfind(L'.');
+                    if (dp != std::wstring::npos) {
+                        ext = d->filePath.substr(dp + 1);
+                        for (auto& c : ext) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+                    }
+                    if (ext == L"jpg" || ext == L"jpeg") filterIdx = 2;
+                    else if (ext == L"bmp")              filterIdx = 3;
+                    else if (!ext.empty() && ext != L"png") filterIdx = 4;
+                }
+                OPENFILENAMEW ofn = {};
+                ofn.lStructSize  = sizeof(ofn);
+                ofn.hwndOwner    = hwnd;
+                ofn.lpstrFile    = szFile;
+                ofn.nMaxFile     = MAX_PATH;
+                ofn.lpstrFilter  = L"PNG画像\0*.png\0JPEG画像\0*.jpg;*.jpeg\0BMP画像\0*.bmp\0すべてのファイル\0*.*\0";
+                ofn.nFilterIndex = filterIdx;
+                ofn.Flags        = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+                if (!GetSaveFileNameW(&ofn)) break;
+                savePath = szFile;
+            }
+            auto* pd = (PaintCtrlData*)GetWindowLongPtr(d->hPaint, GWLP_USERDATA);
+            if (!pd || !SaveImageFile(savePath, pd->hMemDC, pd->bmWidth, pd->bmHeight)) {
+                MessageBoxW(hwnd, (L"保存に失敗しました:\n" + savePath).c_str(),
+                    L"エラー", MB_ICONERROR | MB_OK);
+                break;
+            }
+            d->filePath = savePath;
+            if (pd) pd->modified = false;
+            PostMessage(GetParent(hwnd), WM_APP_IMAGE_EDIT_DONE, 0, (LPARAM)hwnd);
+        }
+        else if (id == IDC_IEP_DISCARD) {
+            auto* pd = (PaintCtrlData*)GetWindowLongPtr(d->hPaint, GWLP_USERDATA);
+            if (pd && pd->modified) {
+                int ret = MessageBoxW(hwnd,
+                    L"変更を破棄しますか？\n保存されていない変更は失われます。",
+                    L"確認", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2);
+                if (ret != IDYES) break;
+            }
+            PostMessage(GetParent(hwnd), WM_APP_IMAGE_EDIT_DONE, 0, (LPARAM)hwnd);
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (d) { delete d; SetWindowLongPtr(hwnd, GWLP_USERDATA, 0); }
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterImageEditPanel(HINSTANCE hInst)
+{
+    WNDCLASSEX wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = ImageEditPanelProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = IMAGE_PANEL_CLASS;
     RegisterClassEx(&wc);
 }
 
@@ -1067,6 +1418,30 @@ static LRESULT CALLBACK OutputPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         break;
     }
 
+    case WM_APP_IMAGE_EDIT_DONE: {
+        // ImageEditPanel から編集終了通知
+        HWND hIP = (HWND)lParam;
+        bool found = false;
+        for (auto& item : d->items)
+            if (item.hwnd == hIP) { found = true; break; }
+
+        if (found) {
+            auto* ipd = (ImageEditPanelData*)GetWindowLongPtr(hIP, GWLP_USERDATA);
+            if (ipd) {
+                EnableWindow(ipd->hBtnSave,     FALSE);
+                EnableWindow(ipd->hBtnSaveAs,   FALSE);
+                EnableWindow(ipd->hBtnDiscard,  FALSE);
+                EnableWindow(ipd->hBtnSizeDown, FALSE);
+                EnableWindow(ipd->hBtnSizeUp,   FALSE);
+                EnableWindow(ipd->hLabelSize,   FALSE);
+                EnableWindow(ipd->hPaint,       FALSE);
+            }
+            OutputPanel_AddPrompt(hwnd);
+            OutputPanel_ScrollToBottom(hwnd);
+        }
+        break;
+    }
+
     case WM_DESTROY:
         if (d) { if (d->hFont) DeleteObject(d->hFont); delete d; }
         break;
@@ -1177,6 +1552,7 @@ void OutputPanel_Register(HINSTANCE hInst)
 {
     RegisterImageCtrl(hInst);
     RegisterPaintCtrl(hInst);
+    RegisterImageEditPanel(hInst);
     RegisterEditPanel(hInst);
     RegisterConsoleCtrl(hInst);
 
@@ -1410,7 +1786,7 @@ void OutputPanel_AddTextView(HWND hPanel, const std::wstring& filePath)
     LayoutPanel(hPanel);
 }
 
-// ---- ペイントツール ---------------------------------------------
+// ---- ペイントツール (ImageEditPanel 経由) ------------------------
 void OutputPanel_AddPaint(HWND hPanel, const std::wstring& path)
 {
     PanelData* d = GetData(hPanel);
@@ -1419,41 +1795,47 @@ void OutputPanel_AddPaint(HWND hPanel, const std::wstring& path)
     RECT rcPanel;
     GetClientRect(hPanel, &rcPanel);
     int panelW = std::max((int)rcPanel.right, 100);
+    int panelH = std::max((int)rcPanel.bottom, 300);
 
-    // 画像サイズを先に取得して高さを確定
+    // 画像サイズを先に取得してキャンバス高さを確定
     Gdiplus::Image* pImg = Gdiplus::Image::FromFile(path.c_str());
     if (pImg && pImg->GetLastStatus() != Gdiplus::Ok) { delete pImg; pImg = nullptr; }
 
-    int height = 400;
+    int imgH = 400;
     if (pImg) {
         UINT iw = pImg->GetWidth();
         UINT ih = pImg->GetHeight();
         if (iw > 0 && ih > 0) {
-            height = (int)((float)ih / iw * panelW);
-            height = std::max(50, std::min(height, 600));
+            imgH = (int)((float)ih / iw * panelW);
+            imgH = std::max(50, std::min(imgH, 600));
         }
     }
+    int totalH = std::max(imgH + IMAGE_PANEL_TOOLBAR_H, panelH);
 
     FinalizeActiveConsole(hPanel);
 
     int yPos = d->totalHeight - d->scrollOffset;
-    HWND hPaint = CreateWindowEx(
-        WS_EX_CLIENTEDGE, PAINT_CTRL_CLASS, nullptr,
-        WS_CHILD | WS_VISIBLE,
-        0, yPos, panelW, height,
+    HWND hIP = CreateWindowEx(
+        0, IMAGE_PANEL_CLASS, nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, yPos, panelW, totalH,
         hPanel, nullptr, d->hInst, nullptr);
 
-    // 画像を PaintCtrl の memory DC に描画
-    auto* pd = (PaintCtrlData*)GetWindowLongPtr(hPaint, GWLP_USERDATA);
-    if (pd && pImg) {
-        Gdiplus::Graphics g(pd->hMemDC);
-        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        g.DrawImage(pImg, 0, 0, pd->bmWidth, pd->bmHeight);
-        InvalidateRect(hPaint, nullptr, FALSE);
+    // filePath を設定し、画像を PaintCtrl の memory DC に描画
+    auto* ipd = (ImageEditPanelData*)GetWindowLongPtr(hIP, GWLP_USERDATA);
+    if (ipd) {
+        ipd->filePath = path;
+        auto* pd = (PaintCtrlData*)GetWindowLongPtr(ipd->hPaint, GWLP_USERDATA);
+        if (pd && pImg) {
+            Gdiplus::Graphics g(pd->hMemDC);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            g.DrawImage(pImg, 0, 0, pd->bmWidth, pd->bmHeight);
+            InvalidateRect(ipd->hPaint, nullptr, FALSE);
+        }
     }
     delete pImg;
 
-    d->items.push_back({ OutputType::Paint, hPaint, height });
+    d->items.push_back({ OutputType::Paint, hIP, totalH });
     LayoutPanel(hPanel);
 }
 

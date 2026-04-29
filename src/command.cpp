@@ -106,6 +106,8 @@ void ExecuteCommand(HWND hOutputPanel, const std::wstring& cmdLine) {
     else if (cmd == L"edit") {
         if (!args.empty() && IsImageFile(ResolvePath(args))) {
             OutputPanel_AddPaint(hOutputPanel, ResolvePath(args));
+            OutputPanel_ScrollToBottom(hOutputPanel);
+            return;
         } else {
             // 引数なし → 新規作成、あり → 既存ファイル編集
             // テキスト編集中はプロンプトを出さない
