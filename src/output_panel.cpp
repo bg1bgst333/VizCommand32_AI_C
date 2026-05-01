@@ -783,6 +783,11 @@ struct ConsoleCtrlData {
     HFONT hFont;
     int   inputStart;  // ユーザー入力開始位置 (この位置より前は保護)
     bool  finalized;   // true になると入力を受け付けない
+    // Tab補完
+    std::vector<std::wstring> tabCandidates;
+    int          tabIdx;     // 現在のサイクル位置
+    std::wstring tabBase;    // 補完開始時の元の入力
+    bool         tabActive;  // 補完サイクル中
 };
 
 // コマンド履歴 (全コンソール共有)
@@ -1054,6 +1059,85 @@ static std::wstring NormalizeNewlines(const std::wstring& s)
 // ConsoleCtrl の高さを計測して OutputPanel のアイテム高を更新しレイアウト
 static void ResizeConsole(HWND hConsole);
 
+// ================================================================
+// Tab補完ヘルパー
+// ================================================================
+
+static const wchar_t* s_tabCommands[] = {
+    L"clear", L"cls", L"edit", L"hello", L"help", L"list", L"view", L"walk"
+};
+
+// input からTab補完候補リストを生成して返す
+static std::vector<std::wstring> BuildTabCandidates(const std::wstring& input)
+{
+    std::vector<std::wstring> candidates;
+
+    size_t spacePos = input.find(L' ');
+
+    if (spacePos == std::wstring::npos) {
+        // コマンド名補完
+        for (auto* cmd : s_tabCommands) {
+            if (_wcsnicmp(cmd, input.c_str(), input.size()) == 0)
+                candidates.push_back(std::wstring(cmd) + L" ");
+        }
+        return candidates;
+    }
+
+    // パス補完
+    std::wstring cmdPart = input.substr(0, spacePos + 1);  // "walk " など
+    std::wstring pathPart = input.substr(spacePos + 1);
+
+    // ディレクトリ部とプレフィックスに分解
+    std::wstring baseDir, prefix;
+    size_t lastSlash = pathPart.find_last_of(L"\\/");
+    if (lastSlash == std::wstring::npos) {
+        baseDir = g_currentDir;
+        prefix  = pathPart;
+    } else {
+        std::wstring dirPart = pathPart.substr(0, lastSlash + 1);
+        prefix = pathPart.substr(lastSlash + 1);
+        // 絶対パス判定: ドライブ文字 or UNC パスなら絶対
+        bool isAbsolute = (dirPart.size() >= 2 && dirPart[1] == L':') ||
+                          (dirPart.size() >= 2 && dirPart[0] == L'\\' && dirPart[1] == L'\\');
+        if (!isAbsolute)
+            baseDir = g_currentDir + L"\\" + dirPart;
+        else
+            baseDir = dirPart;
+    }
+
+    // ファイル列挙
+    std::wstring searchPath = baseDir + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return candidates;
+
+    do {
+        std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (!prefix.empty() && _wcsnicmp(name.c_str(), prefix.c_str(), prefix.size()) != 0)
+            continue;
+
+        std::wstring matched;
+        if (lastSlash == std::wstring::npos)
+            matched = name;
+        else
+            matched = pathPart.substr(0, lastSlash + 1) + name;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            matched += L"\\";
+
+        candidates.push_back(cmdPart + matched);
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+
+    std::sort(candidates.begin(), candidates.end(), [](const std::wstring& a, const std::wstring& b) {
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+    });
+
+    return candidates;
+}
+
 // EDIT サブクラス
 static LRESULT CALLBACK ConsoleEditSubclassProc(
     HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -1068,7 +1152,46 @@ static LRESULT CALLBACK ConsoleEditSubclassProc(
         DWORD selS = 0, selE = 0;
         SendMessage(hwnd, EM_GETSEL, (WPARAM)&selS, (LPARAM)&selE);
 
+        // Tab以外のキーで補完状態リセット
+        if (wParam != VK_TAB && wParam != VK_SHIFT)
+            cd->tabActive = false;
+
         switch (wParam) {
+        case VK_TAB: {
+            if (cd->finalized) return 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+            // 現在の入力を取得
+            int len = GetWindowTextLength(hwnd);
+            std::wstring full(len + 1, L'\0');
+            GetWindowText(hwnd, &full[0], len + 1);
+            full.resize(len);
+            std::wstring curInput = full.substr(cd->inputStart);
+            while (!curInput.empty() && (curInput.back() == L'\r' || curInput.back() == L'\n'))
+                curInput.pop_back();
+
+            if (!cd->tabActive) {
+                // 新規補完: 候補リストを構築
+                cd->tabBase = curInput;
+                cd->tabCandidates = BuildTabCandidates(curInput);
+                if (cd->tabCandidates.empty()) return 0;
+                cd->tabIdx   = shift ? (int)cd->tabCandidates.size() - 1 : 0;
+                cd->tabActive = true;
+            } else {
+                // サイクル
+                if (shift) {
+                    if (--cd->tabIdx < 0)
+                        cd->tabIdx = (int)cd->tabCandidates.size() - 1;
+                } else {
+                    if (++cd->tabIdx >= (int)cd->tabCandidates.size())
+                        cd->tabIdx = 0;
+                }
+            }
+
+            SendMessage(hwnd, EM_SETSEL, cd->inputStart, -1);
+            SendMessage(hwnd, EM_REPLACESEL, FALSE, (LPARAM)cd->tabCandidates[cd->tabIdx].c_str());
+            return 0;
+        }
         case VK_RETURN: {
             if (cd->finalized) return 0;
             HWND hOutputPanel = GetParent(hConsole);
@@ -1144,9 +1267,12 @@ static LRESULT CALLBACK ConsoleEditSubclassProc(
     }
 
     case WM_CHAR:
-        // Enter の改行挿入を抑制
-        if (wParam == L'\r' || wParam == L'\n') return 0;
+        // Enter / Tab の文字挿入を抑制
+        if (wParam == L'\r' || wParam == L'\n' || wParam == L'\t') return 0;
         if (!cd || cd->finalized) return 0;
+        // Tab以外の文字入力で補完状態リセット
+        if (wParam != VK_BACK)
+            cd->tabActive = false;
         // Backspace は WM_KEYDOWN で保護済み
         if (wParam == VK_BACK) {
             DWORD selS = 0, selE = 0;
